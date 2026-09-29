@@ -93,6 +93,68 @@ for "flow" leaves pv=None, which ChessSignalsClient.get_values() skips
 entirely (same treatment CESR got before its PV was known). If a real
 signals.chess.cornell.edu PV for flow turns up, it can be added the same
 way CESR's was.
+
+Also wired in (this round): a real network PV for "energy" --
+ID4B_MON_KEV, given directly by the user in chat, the same way CESR's PV
+was. "energy" was previously SPEC-column-only (pv=None), which is why the
+Overall Summary tab's Energy/Flux readouts stayed at "—" for the user even
+with a SPEC file loaded that had no exactly-matching "energy"/"mono_energy"
+column. With a real PV now wired in, the network fetch path (the "Try live
+network fetch" checkbox, on by default) populates Energy directly, same as
+CESR/IC1/IC2/Diode. "energy" was also moved from its own separate row into
+CHANNEL_ORDER, so it now displays inside the same Beam Condition card row
+as CESR/IC1/IC2/Diode rather than a standalone "X-ray Flux" section -- the
+computed Flux number (not a raw channel) is still shown separately, right
+below that row, since it depends on Energy + IC1 together rather than
+being a channel of its own.
+
+Also wired in (this round, later fully reverted -- see next paragraph):
+EPICS Channel Access (via the optional `pyepics` package) as a preferred
+read path for BEAM_PV_MAP, then narrowed to just "energy", then batched
+via caget_many(). None of it worked cleanly on-site (lnx306): repeated
+"couldn't be located" caRepeater warnings, "cannot connect" lines, and --
+worse -- since the fetch was being called synchronously from
+_beam_signals_tick() (spec_dashboard_qt.py's 1s QTimer, on the main Qt
+thread), every EPICS call that took a few seconds froze the entire GUI
+for that long ("opens but not workable"). The user explicitly asked to
+go back to the previous, HTTP-only logic that was at least partially
+working, and separately confirmed (via a live SPEC session, `caget
+ID4B_MON_KEV` at a real terminal) that Energy genuinely is a normal,
+readable EPICS PV on-site -- so EPICS itself isn't the problem; calling
+it synchronously, once per PV, on every single 1s GUI tick was.
+
+THIS MODULE IS NOW FULLY HTTP-ONLY AGAIN (no `epics`/`pyepics` import
+anywhere in this file, no `prefer_epics` parameter, no fetch_epics()/
+fetch_epics_many()) -- ChessSignalsClient.get_values() and
+get_live_beam_values() are back to exactly the same single
+signals.chess.cornell.edu code path they used before any EPICS work
+started, for every channel including "energy" (BEAM_PV_MAP still carries
+energy's ID4B_MON_KEV entry, so it's tried over HTTP too -- harmless, and
+worth leaving in case that endpoint ever does respond for it).
+
+Live Energy over EPICS is still wanted (the Ion Chamber Flux calculator
+needs it, and the user confirmed the PV works), so it now lives entirely
+in spec_dashboard_qt.py instead, as a small dedicated background
+`QThread` (see EnergyEpicsFetchThread there) that:
+  - imports `epics` and calls `epics.caget("ID4B_MON_KEV", ...)` directly,
+    but only as a ONE-SHOT read -- run() does a single caget() and returns,
+    it is not a loop. The thread is only ever instantiated rarely (once at
+    GUI startup, and again only when the user clicks the "Refresh Energy"
+    button on the Summary tab), per the user's explicit instruction to
+    read Energy "only one time"/"only when needed", not continuously. This
+    is what actually avoids the repeated caRepeater-spawn attempts and the
+    per-tick blocking -- there simply is no per-tick EPICS call anymore.
+  - runs on its own QThread (separate from the Qt main thread), so even a
+    slow or hanging caget() can never freeze the GUI while it's in flight.
+  - is completely independent of the 1s _beam_signals_tick() timer, which
+    just reads whatever Energy value the last one-shot fetch cached (or
+    "—" if none has completed yet).
+  - uses leading_number() (still here, below) to parse caget(as_string=True)'s
+    text reply (e.g. "45.000 keV") the same way the old fetch_epics() did.
+This keeps chess_signals.py itself simple, dependency-light, and fully
+HTTP/CESR-IC1-IC2-diode-focused, matching the "previous logic where
+things were working" baseline, while still getting a genuinely live
+Energy reading, read only on demand rather than continuously.
 """
 
 import re
@@ -181,27 +243,51 @@ def fetch_beam_status_message(
                 return text
     return None
 
-# "No beam" detection for the Summary tab's banner. CESR near 0 (within
-# this tolerance) is treated as "no beam" rather than requiring an exact
-# 0.0 match, since ion chambers/diodes (and possibly CESR itself) can sit
-# at a small nonzero "dark current" baseline that wanders a bit even with
-# genuinely no beam. This is a placeholder value, not a confirmed CHESS
-# spec -- worth revisiting once CESR's PV/multiplier are independently
-# verified (see BEAM_PV_MAP above), since the multiplier is currently an
-# unconfirmed 1x and could change what "near 0" should mean numerically.
-NO_BEAM_CESR_THRESHOLD = 0.5
+# "No beam"/"beam restored" detection for the Summary tab's banner (and
+# the Slack "No Beam"/"Beam Restored" alerts, which reuse the exact same
+# result via is_no_beam()). Two SEPARATE cutoffs with hysteresis, rather
+# than one shared threshold that flips the state the instant CESR crosses
+# it either way: a single 1.4 mA cutoff meant a "Beam Restored" alert
+# could fire (or flap back to "No Beam" and re-fire "Restored" again)
+# purely from CESR sitting anywhere near that one number, without it
+# needing to have actually gone all the way down to a genuine no-beam
+# level first. With two cutoffs and a dead zone in between:
+#   - below NO_BEAM_CESR_THRESHOLD (0.05 mA)       -> confirmed no beam
+#   - at/above BEAM_RESTORED_CESR_THRESHOLD (1.4mA) -> confirmed beam back
+#   - anywhere in between (0.05-1.4 mA)             -> state doesn't change;
+#     stays whatever it already was until CESR actually reaches one of the
+#     two real cutoffs, so a reading merely passing through the middle
+#     can't flip anything on its own.
+# Both are still placeholders, not confirmed CHESS specs -- worth
+# revisiting once CESR's PV/multiplier are independently verified (see
+# BEAM_PV_MAP above), since the multiplier is currently an unconfirmed 1x
+# and could change what these should mean numerically.
+NO_BEAM_CESR_THRESHOLD = 0.05
+BEAM_RESTORED_CESR_THRESHOLD = 1.4
 
 
-def is_no_beam(cesr_value: Optional[float], threshold: float = NO_BEAM_CESR_THRESHOLD) -> bool:
-    """True if cesr_value is close enough to 0 (abs(value) < threshold) to
-    be treated as "no beam". Returns False (not "no beam") for None --
-    i.e. when there's simply no CESR reading available at all (no matching
-    SPEC column and network fetch off/failed), that's "unknown", not a
-    confirmed no-beam state, so the banner shouldn't claim no beam just
-    because it doesn't know."""
+def is_no_beam(cesr_value: Optional[float], previous_no_beam: Optional[bool] = None) -> bool:
+    """Hysteresis-based no-beam/beam-restored detection -- see the cutoffs'
+    docstring above for the 0.05 mA / 1.4 mA / dead-zone logic. Needs the
+    PREVIOUS tick's no-beam state (`previous_no_beam`) to know what to
+    return while CESR is sitting in the 0.05-1.4 mA dead zone, or while
+    there's no reading at all (`cesr_value=None` -- no matching SPEC
+    column, network fetch off/failed): in both cases the state just
+    carries forward unchanged rather than being decided from scratch.
+    `previous_no_beam=None` (no prior tick to compare against -- app just
+    started) is treated as an implicit "beam present" baseline, the same
+    assumption _maybe_alert_beam_slack() makes on its own first tick, so
+    launching mid-dead-zone or with no reading yet doesn't get treated as
+    a confirmed no-beam state out of nowhere."""
+    baseline = bool(previous_no_beam) if previous_no_beam is not None else False
     if cesr_value is None:
+        return baseline
+    abs_value = abs(cesr_value)
+    if abs_value < NO_BEAM_CESR_THRESHOLD:
+        return True
+    if abs_value >= BEAM_RESTORED_CESR_THRESHOLD:
         return False
-    return abs(cesr_value) < threshold
+    return baseline
 
 # ---------------------------------------------------------------------
 # SPEC-file column matching
@@ -226,12 +312,22 @@ def is_no_beam(cesr_value: Optional[float], threshold: float = NO_BEAM_CESR_THRE
 # ChessSignalsClient.get_values(), same as every other channel started out
 # before its PV was known). If there's a signals.chess.cornell.edu PV for
 # flow, it can be added the same way CESR's was.
+# "energy" added for the Ion Chamber Flux feature (Overall Summary tab's
+# Beam Condition row + the dedicated Ion Chamber Flux tab, both of which
+# need a live beam energy in keV to run ion_chamber_flux.ion_chamber_flux()).
+# Matched the same way as the other channels, against whatever the loaded
+# SPEC file's own column happens to be named -- "energy"/"Energy" is a
+# common motor/column name at CHESS for the monochromator energy. The user
+# has since given a confirmed network PV for this (ID4B_MON_KEV -- see
+# BEAM_PV_MAP below), so the SPEC-column path here is now the fallback,
+# not the only source.
 CHANNEL_NAME_PATTERNS: Dict[str, List[str]] = {
     "cesr": ["cesr"],
     "ic1": ["ic1", "ion_chamber1", "ion_chamber_1", "ionchamber1"],
     "ic2": ["ic2", "ion_chamber2", "ion_chamber_2", "ionchamber2"],
     "diode": ["diode", "pin_diode", "pindiode", "beam_stop_diode", "beamstopdiode"],
     "flow": ["flow", "gas_flow", "flow_rate", "cryo_flow"],
+    "energy": ["energy", "mono_energy", "monoenergy", "beam_energy", "beamenergy"],
 }
 
 # Display order + labels for the Summary tab readouts. "flow" -> "Flow
@@ -245,8 +341,18 @@ CHANNEL_LABELS: Dict[str, str] = {
     "ic2": "IC2 (Ion Chamber 2)",
     "diode": "Diode",
     "flow": "Flow Rate",
+    "energy": "Energy",
 }
-CHANNEL_ORDER: List[str] = ["cesr", "ic1", "ic2", "diode", "flow"]
+# "energy" now lives in CHANNEL_ORDER (per the user's explicit request to
+# show it "under the same banner as Beam Condition" alongside CESR/IC1/
+# IC2/Diode, rather than in its own separate row) -- _build_summary_tab()'s
+# beam_row loop iterates this list and only explicitly skips "flow" (still
+# shown in the Temperature Information row instead), so adding "energy"
+# here is what actually moves it into the Beam Condition card row with no
+# other change needed on the display side. The computed Flux readout
+# (not a raw channel -- see ion_chamber_flux.py) stays in its own small
+# section below Beam Condition, since it isn't a live_beam_values() entry.
+CHANNEL_ORDER: List[str] = ["cesr", "ic1", "ic2", "diode", "flow", "energy"]
 
 # Compiled once: each pattern is only allowed to match a column name where
 # it isn't immediately preceded/followed by another digit. Without this, a
@@ -366,6 +472,18 @@ BEAM_PV_MAP: Dict[str, Dict] = {
     # logged column in the sample SPEC data. Add a real pv/multiplier/range
     # here the same way CESR's was added, if one turns up.
     "flow": {"pv": None, "multiplier": 1, "range": (-10, 100)},
+    # Beam energy PV -- ID4B_MON_KEV, given directly by the user in chat
+    # (like CESR's PV before it). The name itself indicates the raw value
+    # read back from signals.chess.cornell.edu is already in keV (the
+    # monochromator energy), not a raw voltage needing ic1/ic2/diode's
+    # x10000-style scaling -- so multiplier is 1, and the range (0, 200)
+    # is a generous keV-scale band around ion_chamber_flux.VALID_RANGE_EV's
+    # 5-100 keV working range, wide enough not to reject a plausible
+    # reading. As with CESR, this PV name has not been independently
+    # verified from this sandbox (still can't reach signals.chess.cornell.
+    # edu here) -- worth sanity-checking the dashboard's live Energy number
+    # against the actual monochromator readout once run on-site.
+    "energy": {"pv": "ID4B_MON_KEV", "multiplier": 1, "range": (0, 200)},
 }
 
 # The cryostat temperature PVs from the user's original temperature-only
@@ -376,13 +494,47 @@ BEAM_PV_MAP: Dict[str, Dict] = {
 # CESR's PV there's no "user told me, unverified" caveat needed here. The
 # multiplier is left at 1 (no scaling) since temperature readings don't
 # have the ion-chamber/diode-style x10000 raw-voltage-to-reading scaling --
-# and the (50, 400) range is a permissive placeholder wide enough to admit
-# plausible Kelvin cryostat readings without rejecting real values, not a
-# confirmed CHESS spec.
+# and the range is a permissive placeholder wide enough to admit plausible
+# Kelvin cryostat readings without rejecting real values, not a confirmed
+# CHESS spec.
+#
+# BUGFIX (was (50, 400)): the lower bound of 50 silently rejected every
+# genuine reading below 50K -- get_values() below sets a channel to None
+# whenever the raw value falls outside "range", and _record_temp_history()
+# in spec_dashboard_qt.py deliberately leaves a channel's plotted line
+# flat/paused (not zero, not a gap) on any tick where its value is None.
+# In combination, once the real cryostat temperature dropped under 50K,
+# every live-network tick for that channel was silently discarded and the
+# Temperature vs Time plot froze at the last accepted reading -- exactly
+# the "stuck at 50K" symptom reported. The Summary strip's Y-axis is
+# already fixed to the full 0-500K range (see setYRange(0, 500, ...) in
+# _build_summary_tab()), so the validation range here is widened to match
+# (0, 500) rather than a narrower band, so genuine readings anywhere in
+# that displayable range are accepted instead of clamped/dropped.
 TEMPERATURE_PV_MAP: Dict[str, Dict] = {
-    "stage1": {"pv": "ID4B_CRYOGL_STG1_T", "multiplier": 1, "range": (50, 400)},
-    "sample": {"pv": "ID4B_CRYOGL_SAM_T", "multiplier": 1, "range": (50, 400)},
-    "stage2": {"pv": "ID4B_CRYOGL_STG2_T", "multiplier": 1, "range": (50, 400)},
+    "stage1": {"pv": "ID4B_CRYOGL_STG1_T", "multiplier": 1, "range": (0, 500)},
+    "sample": {"pv": "ID4B_CRYOGL_SAM_T", "multiplier": 1, "range": (0, 500)},
+    "stage2": {"pv": "ID4B_CRYOGL_STG2_T", "multiplier": 1, "range": (0, 500)},
+}
+
+# The Lakeshore temperature-controller SETPOINT PVs (the target
+# temperature programmed into the controller, not the measured/actual
+# reading -- ID4B_CRYOGL_*_T above), added per the user's explicit request
+# to show the setpoint under each channel's line on the Temperature tab.
+# PV names given directly by the user in chat: LAKESHORE2:SETP_S1 (Stage 1
+# (A)), LAKESHORE2:SETP_S2 (Sample Temp), LAKESHORE2:SETP_S3 (Stage 2 (C)).
+# Same shape as TEMPERATURE_PV_MAP/BEAM_PV_MAP (pv/multiplier/range) so it
+# works with ChessSignalsClient.get_values() unchanged; multiplier 1 (no
+# scaling) and range (0, 500) match TEMPERATURE_PV_MAP's own range, since a
+# setpoint is a target within the same 0-500K displayable window as the
+# actual reading. Setpoints are network-only (see get_live_setpoint_values()
+# below) -- unlike the 3 measured-temperature channels, there's no SPEC-file
+# column equivalent to fall back to, since a setpoint is a controller
+# target, not scan data.
+SETPOINT_PV_MAP: Dict[str, Dict] = {
+    "stage1": {"pv": "LAKESHORE2:SETP_S1", "multiplier": 1, "range": (0, 500)},
+    "sample": {"pv": "LAKESHORE2:SETP_S2", "multiplier": 1, "range": (0, 500)},
+    "stage2": {"pv": "LAKESHORE2:SETP_S3", "multiplier": 1, "range": (0, 500)},
 }
 
 # Canonical temperature channel name -> SPEC column name patterns, mirroring
@@ -504,6 +656,52 @@ def get_live_temperature_values(
     return result
 
 
+def get_live_setpoint_values(
+    use_network: bool = False,
+    client: Optional["ChessSignalsClient"] = None,
+) -> Dict[str, Optional[float]]:
+    """Get the 3 live Lakeshore temperature setpoints (stage1/sample/
+    stage2) from EPICS via SETPOINT_PV_MAP. Network-only, unlike
+    get_live_temperature_values() -- a setpoint is the target value
+    programmed into the Lakeshore controller, not scan data, so there's no
+    SPEC-file column to fall back to. Returns {canonical: float or None};
+    every channel is None when use_network is False (the "Try live
+    network fetch" checkbox is unchecked) or the request fails/finds
+    nothing, same as every other network-sourced channel in this module.
+    Deliberately returns a plain float per channel (not the {"value",
+    "source", "column"} dict shape get_live_temperature_values()/
+    get_live_beam_values() use) since the setpoint is display-only here --
+    it's never plotted, so callers don't need to distinguish its source."""
+    result: Dict[str, Optional[float]] = {c: None for c in SETPOINT_PV_MAP}
+    if not use_network:
+        return result
+    active_client = client or ChessSignalsClient()
+    for c, v in active_client.get_values(SETPOINT_PV_MAP).items():
+        result[c] = v
+    return result
+
+
+def leading_number(text) -> Optional[float]:
+    """Pull the leading numeric portion out of a PV's string value,
+    ignoring any trailing unit/text -- e.g. "51.996 keV" -> 51.996, "0.0231"
+    -> 0.0231, "" or None -> None. Kept here as a small standalone utility
+    for spec_dashboard_qt.py's EnergyEpicsFetchThread, which calls
+    `epics.caget(pv, as_string=True)` directly on a background thread (see
+    that class's docstring) -- that call can come back with the PV's own
+    engineering units appended (depends on the record's EGU field, e.g.
+    "45.000 keV"), and needs a plain float out of it, the same shape this
+    module's HTTP path (fetch_raw()) already returns."""
+    if text is None:
+        return None
+    match = re.match(r"\s*([-+]?\d+\.?\d*(?:[eE][-+]?\d+)?)", str(text))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 class ChessSignalsClient:
     """Thin client for signals.chess.cornell.edu's /plot/UPDATE_{pv}
     endpoint. Only usable from a machine that can actually reach that host
@@ -559,9 +757,19 @@ class ChessSignalsClient:
 
     def get_values(self, pv_map: Dict[str, Dict]) -> Dict[str, Optional[float]]:
         """Fetch + validate + scale every channel in pv_map (a dict shaped
-        like BEAM_PV_MAP/TEMPERATURE_PV_MAP). A channel with pv=None (e.g.
-        "cesr" until its real PV name is known) is always reported as
-        None without making any request for it."""
+        like BEAM_PV_MAP/TEMPERATURE_PV_MAP), all over HTTP
+        (fetch_raw()/signals.chess.cornell.edu). A channel with pv=None
+        (e.g. "flow", which has no known network PV) is always reported
+        as None without making any request for it.
+
+        HTTP-only, full stop -- no EPICS Channel Access here at all (see
+        this module's docstring for why: a real on-site EPICS attempt in
+        this codebase caused repeated caRepeater warnings and, worse, GUI
+        freezes when called synchronously from the 1s Summary-tab tick).
+        Live Energy over EPICS is instead handled entirely in
+        spec_dashboard_qt.py, by a small dedicated one-shot background
+        thread (EnergyEpicsFetchThread) that's completely independent of
+        this client and this function."""
         results: Dict[str, Optional[float]] = {}
         for canonical, info in pv_map.items():
             pv = info.get("pv")
@@ -638,6 +846,15 @@ def get_live_beam_values(
 
     if use_network:
         active_client = client or ChessSignalsClient()
+        # Every BEAM_PV_MAP channel, including "energy", over HTTP only --
+        # see this module's docstring for why EPICS was fully backed out
+        # of this function. get_live_beam_values()'s caller
+        # (spec_dashboard_qt.py's _beam_signals_tick()) separately merges
+        # in a live EPICS Energy reading, sourced from its own
+        # EnergyEpicsFetchThread, on top of whatever this HTTP call
+        # returns for "energy" (which is usually nothing -- ID4B_MON_KEV
+        # has never been confirmed to answer over signals.chess.cornell.edu,
+        # only over real EPICS Channel Access).
         for c, v in active_client.get_values(BEAM_PV_MAP).items():
             if v is not None:
                 # Network-first: overwrite whatever the SPEC file had for

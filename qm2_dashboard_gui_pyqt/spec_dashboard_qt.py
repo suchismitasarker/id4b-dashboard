@@ -31,7 +31,7 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -54,6 +54,8 @@ from reportlab.platypus import (
 
 import spec_core as sc
 import chess_signals as csig
+import beamline_config
+import ion_chamber_flux as icflux
 
 # fabio is only needed for the "Live Image (Pilatus)" tab, which reads
 # .cbf detector frames — the same optional dependency pilatus_live_viewer.py
@@ -375,6 +377,23 @@ QStatusBar {{
 QScrollArea {{
     border: none;
 }}
+QFrame[cardStyle="true"] {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+QLabel[sectionHeader="true"] {{
+    font-size: 11pt;
+    font-weight: 600;
+    padding-bottom: 3px;
+    border-bottom: 1px solid {BORDER};
+    margin-bottom: 2px;
+}}
+QLabel[panelTitle="true"] {{
+    font-size: 10pt;
+    font-weight: 600;
+    color: {ACCENT};
+}}
 """
 
 
@@ -406,12 +425,32 @@ def _color_for(i: int) -> str:
     return PLOT_COLORS[i % len(PLOT_COLORS)]
 
 
+# Fixed, theme-independent colors for the 3 Temperature vs Time curves (and
+# their matching custom-legend swatches), per the user's explicit request:
+# Sample Temp green, Stage 1 (A) red, Stage 2 (C) blue -- rather than the
+# generic per-index PLOT_COLORS cycle used everywhere else, so these 3
+# channels always map to the same intuitive color regardless of theme or
+# plotting order.
+TEMPERATURE_CURVE_COLORS: Dict[str, str] = {
+    "stage1": "#e53935",  # red
+    "sample": "#43a047",  # green
+    "stage2": "#1e88e5",  # blue
+}
+
+
 class PlotPanel(QtWidgets.QWidget):
     """Wraps a pyqtgraph PlotWidget with a legend, zoom/reset toolbar, and a
     simple empty-state message."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, show_grid: bool = True, show_x_in_crosshair: bool = True):
         super().__init__(parent)
+        self._show_grid = show_grid
+        # When False, the hover crosshair only shows the Y value/line (no
+        # vertical line, no "x = ..." text) -- used for the Summary tab's
+        # Temperature vs Time plot, where the X axis is just elapsed
+        # minutes and the number people actually want at a glance is the
+        # temperature under the cursor, not which minute it was at.
+        self._show_x_in_crosshair = show_x_in_crosshair
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
@@ -439,7 +478,7 @@ class PlotPanel(QtWidgets.QWidget):
         layout.addLayout(toolbar)
 
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.showGrid(x=self._show_grid, y=self._show_grid, alpha=0.3)
         self.legend = self.plot_widget.addLegend(offset=(10, 10))
         self._style_legend()
         # Draw a full box border around the plotting area — by default
@@ -499,12 +538,16 @@ class PlotPanel(QtWidgets.QWidget):
         y_log = bool(getattr(self.plot_widget.getAxis("left"), "logMode", False))
         disp_x = 10 ** vx if x_log else vx
         disp_y = 10 ** vy if y_log else vy
-        self._crosshair_v.setPos(vx)
         self._crosshair_h.setPos(vy)
-        self._crosshair_v.setVisible(True)
         self._crosshair_h.setVisible(True)
         self._coord_label.setPos(vx, vy)
-        self._coord_label.setText(f"x = {disp_x:.4g}\ny = {disp_y:.4g}")
+        if self._show_x_in_crosshair:
+            self._crosshair_v.setPos(vx)
+            self._crosshair_v.setVisible(True)
+            self._coord_label.setText(f"x = {disp_x:.4g}\ny = {disp_y:.4g}")
+        else:
+            self._crosshair_v.setVisible(False)
+            self._coord_label.setText(f"y = {disp_y:.4g}")
         self._coord_label.setVisible(True)
 
     def apply_theme(self):
@@ -1059,6 +1102,291 @@ class LiveImageLoader(QtCore.QThread):
             self._loaded_mtime = mtime
             self.newImage.emit(data, path, mtime, self._active_dir)
             time.sleep(interval)
+
+
+class SpecFileLoader(QtCore.QThread):
+    """Background one-shot worker that re-reads and re-parses a SPEC file
+    off the main/GUI thread.
+
+    spec_core.load_spec_file() has no incremental/append-only mode -- every
+    call re-reads the WHOLE file from disk and re-parses it from scratch,
+    including every scan that was already there before. For a small demo
+    file that's instant, but for a large, actively-growing SPEC file (the
+    normal case during a live beamline run) it can take real, perceptible
+    time. _auto_refresh_tick() and _summary_refresh_tick() both used to
+    call load_spec_file() directly, synchronously, right on the Qt main
+    thread, every single 0.1s tick that the file's mtime had changed --
+    and since an actively-writing SPEC file's mtime changes on nearly
+    every tick, that meant a full re-parse nearly 10x/second, each one
+    blocking the entire UI (including the timer that's supposed to fire
+    every 0.1s) until it finished. That's exactly what turned "updates
+    every 0.1s" into "updates every ~10s": the reparse itself was taking
+    on the order of 10s, and nothing else -- redraw, timers, clicks --
+    could happen while it ran.
+
+    Running the reparse here instead means the GUI stays responsive (and
+    the lightweight per-tick redraw of already-loaded data keeps happening
+    on schedule) while a slow reparse is in flight; the freshly-parsed
+    data just arrives a little later, via the `loaded` signal, instead of
+    freezing the whole app for however long parsing takes.
+
+    Also times itself (wall-clock, via time.time()) and reports the
+    elapsed seconds back on both signals -- useful for telling apart a
+    slow *local* re-parse (large file, lots of scans -- CPU-bound, fix is
+    an incremental parser) from a slow *read* (the file living on a
+    network mount, e.g. running the viewer on a different machine than
+    the one SPEC is actually writing on -- I/O-bound, no parser change
+    would help, that's inherent to reading a growing file over the
+    network / NFS attribute-cache behavior). Watch the status bar message
+    after a reload to see which one you're dealing with."""
+
+    loaded = QtCore.pyqtSignal(object, object, object, object, str, float, float)  # df, columns, metadata, scan_info, path, mtime, elapsed_seconds
+    failed = QtCore.pyqtSignal(str, float)  # message, elapsed_seconds
+
+    def __init__(self, path: str, mtime: float):
+        super().__init__()
+        self.path = path
+        self.mtime = mtime
+
+    def run(self):
+        started = time.time()
+        try:
+            df, columns, metadata, scan_info = sc.load_spec_file(self.path)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc), time.time() - started)
+            return
+        self.loaded.emit(df, columns, metadata, scan_info, self.path, self.mtime, time.time() - started)
+
+
+class EnergyEpicsFetchThread(QtCore.QThread):
+    """Background ONE-SHOT worker that reads the live beam energy
+    (ID4B_MON_KEV) over EPICS Channel Access, via the optional `pyepics`
+    package -- and only over EPICS, never HTTP, since
+    signals.chess.cornell.edu has never been confirmed to answer for this
+    PV (see chess_signals.py's module docstring), while a plain `caget
+    ID4B_MON_KEV` at a real on-site terminal was confirmed by the user to
+    return a normal reading (e.g. "45.000 keV").
+
+    Deliberately a ONE-SHOT thread (run() does a single caget() and
+    returns), not a continuous polling loop -- per the user's explicit
+    request to read Energy "only one time"/"only when needed" rather than
+    on every 1s Summary-tab tick. SpecDashboardApp fires one of these at
+    startup, and another each time the user clicks "Refresh Energy" (see
+    _build_summary_tab()) or re-checks "Try live network fetch" -- never
+    automatically/continuously -- so a whole on-site session normally
+    only ever creates a small, deliberate handful of CA contexts instead
+    of one per second. That's the direct fix for the real regression seen
+    on lnx306: calling into EPICS from a fresh thread on every 1s tick
+    re-initialized a CA context each time, which is what was printing
+    repeated "couldn't be located"/"cannot connect" caRepeater warnings
+    and making the whole GUI slow -- a rare, explicit, one-shot fetch
+    doesn't do that.
+
+    Also keeps the GUI thread completely unblocked regardless of how long
+    a single caget() takes: this runs on its own QThread, emits its
+    result via the `energy_ready` signal (float or None), and
+    SpecDashboardApp just caches whatever it last received
+    (self._live_energy_value) -- _beam_signals_tick() never waits on this
+    thread, it only reads the cache.
+
+    Default timeout is 8s, not pyepics's usual ~1-5s default -- with no
+    CA Repeater available (see the "couldn't be located" warning), the
+    very first connection attempt in a process can take noticeably
+    longer, since libca falls back to its own UDP search/retry sequence
+    instead of getting a quick answer relayed through the repeater. A
+    generous timeout costs nothing here since this never blocks the UI
+    (see above) and only ever runs a handful of times per session.
+
+    Also emits `diagnostic_ready` (str) alongside `energy_ready`, every
+    time, success or failure -- a one-line summary (pyepics importable?,
+    the caRepeater bin dir this run() found and prepended to PATH (or
+    None), and HOW it found that dir -- via `caget` on PATH, or via the
+    find_libca() fallback described below), the EPICS_CA_ADDR_LIST/
+    EPICS_CA_AUTO_ADDR_LIST/EPICS_CA_NAME_SERVERS env vars this process
+    actually sees, the raw caget() reply or exception). Added after an
+    on-site report of `caget ID4B_MON_KEV` succeeding at a real ID4B
+    terminal while this thread's own epics.caget() call still failed to
+    connect with "cannot connect to ID4B_MON_KEV", alongside libca's own
+    startup warning: "The executable 'caRepeater' couldn't be located ...
+    You may need to modify your PATH environment variable." A follow-up
+    on-site check (`python3 -c "import epics; print(epics.ca.find_libca())"`)
+    confirmed this Python process loads the EXACT SAME libca.so the
+    working `caget` CLI links against (both come from the same
+    /nfs/chess/sw/anaconda3_jpcr EPICS install) -- ruling out a libca
+    version/build mismatch. That leaves the literal warning text as the
+    best remaining explanation: `caRepeater` normally lives in that same
+    install's bin/ dir right next to `caget`, but this GUI process's own
+    $PATH may not include that dir, so libca's attempt to spawn a local
+    CA Repeater to relay UDP search replies fails, degrading every CA
+    search to a raw, less reliable broadcast.
+
+    Fix, two-pronged: (1) before importing epics, run() first tries
+    `shutil.which("caget")` and prepends ITS directory to this process's
+    `os.environ["PATH"]` if not already present. (2) If that finds
+    nothing, a bare non-conda shell on lnx306 was confirmed on-site to
+    report "caget: command not found" -- i.e. `caget` itself is only on
+    $PATH inside specific activated environments (e.g. `(qm2_SPEC)`), so
+    a plain PATH lookup for `caget` can't be relied on from every
+    environment this GUI might be launched from either. As a fallback,
+    run() imports epics first (which does NOT by itself need caRepeater --
+    that's only needed once an actual CA network call like caget() is
+    made) and calls `epics.ca.find_libca()`, which was already confirmed
+    on-site to succeed and return .../anaconda3_jpcr/epics/lib/linux-x86_64/
+    libca.so via pyepics's own internal library search (not $PATH). Since
+    a standard EPICS install mirrors bin/<arch> and lib/<arch> as sibling
+    directories under the same install root, swapping the first "/lib/"
+    for "/bin/" in that already-known-working path gives the same
+    caRepeater directory without ever needing `caget` on $PATH at all.
+
+    CONFIRMED ROOT CAUSE (final): the PATH fix above genuinely did fix
+    the caRepeater problem it targeted -- a follow-up on-site run showed
+    the "couldn't be located" warning gone entirely -- but "cannot
+    connect to ID4B_MON_KEV" still persisted afterward. The decisive test
+    was running the plain `caget ID4B_MON_KEV` CLI directly on lnx306
+    (`(qm2_SPEC) [chess_id4b@lnx306 ...]$ caget ID4B_MON_KEV`), with NO
+    Python or GUI involved at all: it failed with the exact same
+    "Channel connect timed out: 'ID4B_MON_KEV' not found." That's outside
+    this codebase entirely, so it rules out every hypothesis above (CA
+    Repeater, libca version, PATH) as the ultimate cause. The one
+    remaining fact that explains it: the user's very first successful
+    `caget ID4B_MON_KEV` test was run from a host literally named `id4b`
+    (not lnx306) -- confirmed by an on-site terminal paste showing `ssh
+    -Y lnx306` run FROM `[chess_id4b@id4b ~]$`. EPICS Channel Access
+    relies on UDP broadcast for PV search by default, and broadcasts
+    typically don't cross subnet/VLAN boundaries -- so if `id4b` sits on
+    the beamline's own network segment (where the IOC owning
+    ID4B_MON_KEV lives) and `lnx306` doesn't, `lnx306` would never
+    receive that broadcast no matter what's fixed in this process's
+    PATH, libca, or CA Repeater setup. This is a genuine network
+    reachability limitation of whichever host the GUI is launched from,
+    not fixable from inside this codebase -- see _on_energy_ready()'s
+    on-failure message for the on-site-facing explanation and the
+    "Follow live values" manual-Energy-entry workaround on the Ion
+    Chamber Flux tab. The two PATH-fix prongs above are kept regardless,
+    since they're correct and harmless fixes for the CA-Repeater-missing
+    problem they solved -- just not sufficient on their own on a host
+    that can't reach the IOC's broadcast at all.
+
+    FULLY CONFIRMED: the user subsequently ran this actual GUI (not just
+    the bare `caget` CLI) from the `id4b` host itself and reported Energy
+    working correctly there -- closing the loop on this diagnosis with no
+    remaining ambiguity. This code needs no further changes for this
+    issue: on `id4b` (or any host on the beamline's own network segment),
+    Energy/Flux work as designed; on `lnx306` (or any host that can't
+    reach the IOC's CA broadcast), the "Follow live values" manual-entry
+    workaround above is the correct, expected way to still get a Flux
+    number until/unless CHESS's network/control-systems team provides a
+    way for that host to reach the PV directly (e.g. a CA gateway or an
+    explicit EPICS_CA_ADDR_LIST entry)."""
+
+    energy_ready = QtCore.pyqtSignal(object)  # float or None
+    diagnostic_ready = QtCore.pyqtSignal(str)
+
+    def __init__(self, pv_name: str = "ID4B_MON_KEV", timeout: float = 8.0):
+        super().__init__()
+        self.pv_name = pv_name
+        self.timeout = timeout
+
+    def run(self):
+        # Make sure `caRepeater` can be found alongside the `caget` CLI
+        # that's already confirmed working on-site: libca.so tries to
+        # execvp("caRepeater", ...) so it can relay UDP CA search/beacon
+        # traffic locally, and fails silently into a slower/less reliable
+        # broadcast-only mode if that executable isn't on $PATH -- which
+        # is exactly what the "couldn't be located ... modify your PATH"
+        # startup warning says. Try #1: shutil.which("caget") finds
+        # wherever the working `caget` binary actually lives right now
+        # (if it's on this process's own $PATH), and caRepeater ships in
+        # that same bin/ directory in a standard EPICS install.
+        caget_path = shutil.which("caget")
+        caget_bin_dir = os.path.dirname(caget_path) if caget_path else None
+        bin_dir_source = "shutil.which(caget)" if caget_bin_dir else None
+        try:
+            import epics
+        except ImportError as exc:
+            env_bits = ", ".join(
+                f"{var}={os.environ.get(var, '<unset>')!r}"
+                for var in ("EPICS_CA_ADDR_LIST", "EPICS_CA_AUTO_ADDR_LIST", "EPICS_CA_NAME_SERVERS")
+            )
+            self.diagnostic_ready.emit(
+                f"pyepics not importable ({exc}); caget_bin_dir=None; {env_bits}"
+            )
+            self.energy_ready.emit(None)
+            return
+        # Extra breadcrumbs for the find_libca() fallback below -- kept as
+        # None/blank unless that fallback actually runs, so a failure can
+        # be pinned to an exact step instead of collapsing to a single
+        # "None" in the diagnostic line. Traced from pyepics's own
+        # epics.ca.find_lib() source (installed in this sandbox to read
+        # directly): it tries, in order, (1) the PYEPICS_LIBCA env var,
+        # (2) an already-imported `epicscorelibs` package, (3) a libca
+        # bundled inside the installed `epics` package itself, then (4)
+        # a combined scan of $PATH + $LD_LIBRARY_PATH via ctypes'
+        # find_library() -- and only raises ChannelAccessException if
+        # ALL FOUR fail. Our own bare `except Exception` around it was
+        # silently swallowing exactly which of those happened.
+        libca_path = None
+        libca_error = None
+        candidate = None
+        candidate_exists = None
+        if caget_bin_dir is None:
+            # Try #2: a bare shell on lnx306 was confirmed on-site to NOT
+            # have `caget` on $PATH at all ("caget: command not found"),
+            # so it can't be relied on to be on THIS process's $PATH
+            # either. Fall back to deriving the same directory from
+            # wherever pyepics itself already successfully found
+            # libca.so (confirmed on-site to work via a standalone
+            # `python3 -c "import epics; print(epics.ca.find_libca())"`
+            # test) by swapping the install's lib/<arch> dir for its
+            # sibling bin/<arch> dir.
+            try:
+                libca_path = epics.ca.find_libca()
+            except Exception as exc:
+                libca_error = repr(exc)
+            if libca_path and "/lib/" in libca_path:
+                candidate = os.path.dirname(libca_path).replace("/lib/", "/bin/", 1)
+                candidate_exists = os.path.isdir(candidate)
+                if candidate_exists:
+                    caget_bin_dir = candidate
+                    bin_dir_source = "find_libca() lib/->bin/"
+        if caget_bin_dir:
+            path_parts = os.environ.get("PATH", "").split(os.pathsep)
+            if caget_bin_dir not in path_parts:
+                os.environ["PATH"] = caget_bin_dir + os.pathsep + os.environ.get("PATH", "")
+        env_bits = ", ".join(
+            f"{var}={os.environ.get(var, '<unset>')!r}"
+            for var in (
+                "EPICS_CA_ADDR_LIST", "EPICS_CA_AUTO_ADDR_LIST",
+                "EPICS_CA_NAME_SERVERS", "PYEPICS_LIBCA", "LD_LIBRARY_PATH",
+            )
+        )
+        diag_prefix = f"caget_bin_dir={caget_bin_dir!r} (via {bin_dir_source})"
+        if caget_bin_dir is None:
+            # Only relevant (and only computed above) when both Try #1
+            # and Try #2 failed -- pin down exactly which step of
+            # find_lib()'s 4-step search broke down.
+            diag_prefix += (
+                f", find_libca()={libca_path!r}"
+                f", find_libca_error={libca_error!r}"
+                f", derived_bin_candidate={candidate!r}"
+                f", candidate_isdir={candidate_exists!r}"
+            )
+        env_bits = f"{diag_prefix}, {env_bits}"
+        try:
+            raw = epics.caget(
+                self.pv_name, as_string=True,
+                timeout=self.timeout, connection_timeout=self.timeout,
+            )
+        except Exception as exc:
+            raw = None
+            self.diagnostic_ready.emit(
+                f"caget({self.pv_name}) raised {exc!r}; {env_bits}"
+            )
+        else:
+            self.diagnostic_ready.emit(
+                f"caget({self.pv_name}) returned {raw!r}; {env_bits}"
+            )
+        self.energy_ready.emit(csig.leading_number(raw))
 
 
 class LiveImageTab(QtWidgets.QWidget):
@@ -1713,6 +2041,36 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self.last_plot_info: Optional[Dict] = None
         self._suspend_auto_plot = False
 
+        # Beamline config (beamline_config.py / configs/qm2.yaml) -- QM2
+        # (ID4B) only, loaded once at startup. Used for the Ion Chamber
+        # Flux tab's and Summary tab's per-chamber gas/method/length/gain
+        # defaults (self._flux_chamber_defaults below); everything else in
+        # the config file is documentation for now, not yet read anywhere
+        # else in this app (see the scope note at the top of
+        # configs/qm2.yaml). A missing or broken YAML file must not crash
+        # the whole dashboard -- it falls back to hardcoded defaults and
+        # the Ion Chamber Flux tab still works, just without config-
+        # supplied per-chamber values pre-filled.
+        self.beamline_cfg: Optional[Dict] = None
+        self._beamline_cfg_error: Optional[str] = None
+        try:
+            self.beamline_cfg = beamline_config.load_config()
+        except Exception as exc:
+            self._beamline_cfg_error = str(exc)
+
+        _FALLBACK_FLUX_CHAMBER = {
+            "gas": "Nitrogen", "method": 0, "length_cm": 6.0, "gain_a_per_v": 1e-6,
+        }
+        chambers_cfg = {}
+        if self.beamline_cfg is not None:
+            chambers_cfg = (
+                self.beamline_cfg.get("signals", {}).get("flux", {}).get("chambers", {}) or {}
+            )
+        self._flux_chamber_defaults: Dict[str, Dict] = {
+            "ic1": dict(_FALLBACK_FLUX_CHAMBER, **chambers_cfg.get("ic1", {})),
+            "ic2": dict(_FALLBACK_FLUX_CHAMBER, **chambers_cfg.get("ic2", {})),
+        }
+
         # Optional "reference file" data, loaded independently of the main
         # file and overlaid as an extra curve on the Plot tab (folded in
         # from the old standalone Compare Plot tab).
@@ -1754,6 +2112,25 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self._autorefresh_timer = QtCore.QTimer(self)
         self._autorefresh_timer.timeout.connect(self._auto_refresh_tick)
 
+        # "Auto-detect new SPEC file" -- deliberately separate from both
+        # _watch_timer and _autorefresh_timer above: those two only ever
+        # re-check the ALREADY-loaded file's own mtime (has this specific
+        # file grown?), so neither one ever notices when SPEC starts
+        # writing to a brand new file instead (e.g. a new day's file, a
+        # new sample's file) -- that always required a manual Browse/Load
+        # by hand. This timer instead re-scans the watched folder itself
+        # every 5s for whichever SPEC file now has the newest mtime, and
+        # calls load_file() on it the moment that's a different path than
+        # what's currently loaded -- the folder-level equivalent of what
+        # the Live Image tab's LiveImageLoader already does for .cbf
+        # frames (find the newest thing in a watched location, load it
+        # automatically), just applied to SPEC files instead of frames.
+        # Runs continuously once enabled (not tied to any tab's
+        # visibility) since the whole point is background monitoring.
+        self._new_file_watch_timer = QtCore.QTimer(self)
+        self._new_file_watch_timer.setInterval(5000)
+        self._new_file_watch_timer.timeout.connect(self._check_for_new_spec_file)
+
         # Summary tab: a always-live, watch-only view (side-by-side latest-
         # scan plot + mirrored Live Image feed) that refreshes on its own
         # 0.1s timer, independent of the Plot tab's own Auto-Refresh
@@ -1768,6 +2145,23 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self._summary_timer.setInterval(100)
         self._summary_timer.timeout.connect(self._summary_refresh_tick)
         self._summary_watch_mtime: Optional[float] = None
+
+        # Shared background reparse worker (see SpecFileLoader's docstring)
+        # -- used by both _auto_refresh_tick() and _summary_refresh_tick()
+        # instead of either one reparsing the file synchronously/inline.
+        # Sharing ONE loader instance across both call sites also means
+        # that if Auto-Refresh (not tied to any particular tab) happens to
+        # be running at the same time the Summary tab is visible, they
+        # don't each kick off their own redundant full reparse of the same
+        # file -- _kick_off_background_reload()'s isRunning() guard makes
+        # whichever tick gets there first "win" and the other just waits
+        # for that same result.
+        self._file_loader_thread: Optional[SpecFileLoader] = None
+        # Wall-clock seconds the last background SpecFileLoader run took --
+        # surfaced in the Summary tab's status line and the Auto-Refresh
+        # status message so a slow refresh's cause (big file to parse vs.
+        # slow network read) is visible instead of just "it feels slow".
+        self._last_reload_seconds: Optional[float] = None
 
         # Summary tab: 5 live channels sourced via chess_signals.py's
         # get_live_beam_values() (CESR, IC1, IC2, diode, Flow), refreshed
@@ -1794,12 +2188,75 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self._beam_signals_timer.setInterval(1000)
         self._beam_signals_timer.timeout.connect(self._beam_signals_tick)
 
+        # Live Energy (EPICS Channel Access, PV ID4B_MON_KEV) -- read via
+        # a one-shot EnergyEpicsFetchThread (see that class's docstring),
+        # never on the 1s _beam_signals_timer tick above. self._live_energy_value
+        # is the cache _beam_signals_tick() reads from every tick;
+        # self._energy_fetch_thread tracks the currently in-flight
+        # one-shot fetch (if any) so closeEvent() can wait for it to
+        # finish cleanly on shutdown. self._energy_fetch_in_progress is a
+        # plain bool -- NOT `self._energy_fetch_thread.isRunning()` -- used
+        # by _refresh_energy_now() to avoid piling up more than one fetch
+        # at a time; a real on-site run showed that checking
+        # `.isRunning()` on a QThread that had already emitted `finished`
+        # (and been scheduled for deletion via `deleteLater()`) raises
+        # "RuntimeError: wrapped C/C++ object ... has been deleted" on the
+        # very next click, since the underlying Qt object may already be
+        # gone by then -- a plain Python bool has no such lifetime issue.
+        self._live_energy_value: Optional[float] = None
+        self._energy_fetch_thread: Optional[EnergyEpicsFetchThread] = None
+        self._energy_fetch_in_progress: bool = False
+
+        # Flux (Overall Summary tab's "Flux (IC1)" card, and the Ion
+        # Chamber Flux tab's "Follow live values" fields) is a SNAPSHOT,
+        # not a continuously-live value -- it's only (re)computed inside
+        # _snapshot_flux_from_energy(), called once per successful Energy
+        # refresh (from _on_energy_ready()), never from the 1s
+        # _beam_signals_timer tick. Per the user's explicit request ("I
+        # don't need updated flux all the time... if I refresh then
+        # energy, then only it will show the flux, not all the time
+        # updated" / "realtime updated version not need" / "only once
+        # during refresh") -- Flux used to be recomputed every tick from a
+        # continuously-live IC1 reading even though Energy itself was
+        # already refresh-only, which is exactly the "changes on its own"
+        # behavior this cache avoids. None until the first successful
+        # Energy refresh (including the automatic one at startup below).
+        self._live_flux_snapshot: Optional[Dict] = None
+
+        # Temperature-vs-time history for the Summary tab's "Temperature
+        # vs Time" plot (Y axis fixed 0-500K, X axis in minutes elapsed
+        # since the app started tracking -- i.e. since this window opened,
+        # not tied to when/whether a SPEC file happens to be loaded, since
+        # _beam_signals_tick() itself runs continuously regardless of
+        # file-load state). One (times, values) pair of plain lists per
+        # canonical channel in chess_signals.TEMPERATURE_ORDER (stage1/
+        # sample/stage2); appended to once a second in _beam_signals_tick(),
+        # skipping ticks where that channel's live value is None (no
+        # matching SPEC column and no/failed network fetch) rather than
+        # plotting a gap or a zero. self._temp_history_start_time is set on
+        # the very first tick (see _beam_signals_tick()) so elapsed minutes
+        # is always relative to that first reading, not wall-clock time
+        # directly. Kept as plain in-memory lists with no cap/decimation --
+        # fine for a single session's worth of 1Hz points, but worth
+        # revisiting (e.g. downsampling old points) if this app is ever
+        # left running continuously for many days at a stretch.
+        self._temp_history: Dict[str, Tuple[List[float], List[float]]] = {
+            canonical: ([], []) for canonical in csig.TEMPERATURE_ORDER
+        }
+        self._temp_history_start_time: Optional[float] = None
+
         self._build_menu()
         self._build_central()
         self._build_statusbar()
 
         self._beam_signals_tick()
         self._beam_signals_timer.start()
+
+        # One automatic, one-shot live Energy read at startup (see
+        # EnergyEpicsFetchThread's docstring for why this is a single
+        # fetch-once call, not part of the 1s tick above) -- after that,
+        # Energy only updates again if the user clicks "Refresh Energy".
+        self._refresh_energy_now()
 
         self.status_label.setText("Ready.")
         self._refresh_file_tree()
@@ -1912,8 +2369,43 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
 
         # Re-skin already-constructed plot panels (pg.setConfigOptions only
         # affects newly created PlotWidgets, not ones already on screen).
-        for panel in (self.plot_panel, self.plot_fit_residuals_panel, self.summary_plot_panel):
+        for panel in (self.plot_panel, self.plot_fit_residuals_panel, self.summary_plot_panel,
+                      self.temp_history_panel, self.temperature_tab_panel):
             panel.apply_theme()
+
+        # Re-apply the fixed Temperature vs Time curve colors (and their
+        # matching custom-legend swatches) on every theme switch, for BOTH
+        # the Overall Summary strip (temp_legend_row in _build_summary_tab())
+        # and the dedicated Temperature tab (controls_row in
+        # _build_temperature_tab()). Unlike the other plots -- which
+        # panel.clear() + fully re-plot on every refresh -- these curves are
+        # created once at tab-build time and only ever updated via
+        # setData(), so their pens (and the legend swatches' background
+        # colors) would otherwise keep whatever color they were given
+        # before. All of them always use the fixed TEMPERATURE_CURVE_COLORS
+        # mapping (red/green/blue by channel, per the user's request), not
+        # the theme's generic PLOT_COLORS cycle, so this re-apply is really
+        # just a no-op safety net rather than an actual theme-driven
+        # recolor -- but it's kept here so nothing else (e.g. a future
+        # PLOT_COLORS-based change) can silently drift these away from
+        # their fixed colors on a theme switch.
+        for curves_attr, swatches_attr in (
+            ("temp_history_curves", "temp_history_legend_swatches"),
+            ("temperature_tab_curves", "temperature_tab_legend_swatches"),
+        ):
+            curves = getattr(self, curves_attr, None)
+            if not curves:
+                continue
+            swatches = getattr(self, swatches_attr, {})
+            for canonical in csig.TEMPERATURE_ORDER:
+                color = TEMPERATURE_CURVE_COLORS.get(canonical, _color_for(0))
+                curve = curves.get(canonical)
+                if curve is not None:
+                    curve.setPen(pg.mkPen(color=color, width=2))
+                swatch = swatches.get(canonical)
+                if swatch is not None:
+                    swatch.setStyleSheet(f"background-color: {color}; border-radius: 3px;")
+
         if hasattr(self, "live_image_tab"):
             self.live_image_tab.apply_theme()
 
@@ -1970,7 +2462,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         # disk, so anything faster risks flooding the UI thread on larger
         # SPEC files without any real benefit.
         self.autorefresh_interval_combo.addItems(["0.1s", "1s", "5s", "10s", "30s", "60s"])
-        self.autorefresh_interval_combo.setCurrentText("10s")
+        self.autorefresh_interval_combo.setCurrentText("0.1s")
         self.autorefresh_interval_combo.setToolTip(
             "How often to check the file for changes. 0.1s is the fastest "
             "option available."
@@ -1986,6 +2478,26 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             "one without needing a separate tab."
         )
         top_bar.addWidget(self.compare_prev_chk)
+
+        top_bar.addWidget(QtWidgets.QLabel("Auto-detect new file:"))
+        self.new_file_detect_chk = QtWidgets.QCheckBox()
+        self.new_file_detect_chk.setToolTip(
+            "Watch the loaded file's folder (or the current Browse folder, "
+            "if nothing's loaded yet) for a SPEC file with a newer "
+            "modification time than the one currently loaded, and switch "
+            "to it automatically -- no manual Browse/Load needed. This is "
+            "different from Auto-Refresh: Auto-Refresh only re-polls the "
+            "SAME loaded file for new scans being appended to it; this "
+            "notices when SPEC starts writing to an entirely different "
+            "file instead (e.g. a new day's or new sample's file) and "
+            "switches over. Checks every 5 seconds. Since it always "
+            "follows whichever file is newest, it will switch away again "
+            "even from a file you loaded manually, as soon as a newer one "
+            "appears."
+        )
+        self.new_file_detect_chk.toggled.connect(self._on_new_file_detect_toggled)
+        top_bar.addWidget(self.new_file_detect_chk)
+
         outer.addLayout(top_bar)
 
         # Splitter: file tree (left) / tabs (right)
@@ -2011,6 +2523,8 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self._build_motor_positions_tab()
         self._build_live_image_tab()
         self._build_summary_tab()
+        self._build_temperature_tab()
+        self._build_ion_flux_tab()
         self._build_slack_alerts_tab()
         self._build_export_tab()
 
@@ -2026,6 +2540,8 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             "Overall Summary",
             "SPEC Plot",
             "Live Image (Pilatus)",
+            "Temperature",
+            "Ion Chamber Flux",
             "Folder Timeline",
             "Scan Info",
             "Motor Positions",
@@ -2082,21 +2598,25 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         # layout, so it's left-aligned above the row like the other
         # section labels here.
         self.beam_condition_header = QtWidgets.QLabel("Beam Condition")
-        self.beam_condition_header.setStyleSheet(
-            "font-size: 11pt; font-weight: bold;"
-        )
+        self.beam_condition_header.setProperty("sectionHeader", True)
         layout.addWidget(self.beam_condition_header)
+        layout.addSpacing(2)
 
-        # 4 live beam-monitor readouts (CESR, IC1, IC2, diode), refreshed
-        # once a second by _beam_signals_tick() via chess_signals.py. Each
-        # is its own small boxed "card" with a name and a big value; a
-        # checkbox lets the (opt-in, on-site-only) direct network fetch
-        # from signals.chess.cornell.edu be turned on to fill in any
-        # channel the loaded SPEC file's own columns don't have. Flow is
-        # also one of chess_signals.CHANNEL_ORDER (its value still comes
-        # from get_live_beam_values() exactly like these 4), but per the
-        # user's request it's displayed below with the temperature
-        # readouts rather than in this row -- skipped here.
+        # 5 live beam-monitor readouts (CESR, IC1, IC2, diode, Energy),
+        # refreshed once a second by _beam_signals_tick() via
+        # chess_signals.py. Each is its own small boxed "card" with a name
+        # and a big value; a checkbox lets the (opt-in, on-site-only)
+        # direct network fetch from signals.chess.cornell.edu be turned on
+        # to fill in any channel the loaded SPEC file's own columns don't
+        # have. Energy (PV ID4B_MON_KEV) was added to this row per the
+        # user's explicit request to show it "under the same banner as
+        # Beam Condition" rather than in a separate section -- it's simply
+        # part of csig.CHANNEL_ORDER now, so it falls out of this same loop
+        # with no other change needed. Flow is also one of
+        # chess_signals.CHANNEL_ORDER (its value still comes from
+        # get_live_beam_values() exactly like these 5), but per the user's
+        # request it's displayed below with the temperature readouts
+        # rather than in this row -- skipped here.
         beam_row = QtWidgets.QHBoxLayout()
         self.beam_signal_labels: Dict[str, QtWidgets.QLabel] = {}
         for canonical in csig.CHANNEL_ORDER:
@@ -2104,8 +2624,10 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
                 continue
             box = QtWidgets.QFrame()
             box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            box.setProperty("cardStyle", True)
             box_layout = QtWidgets.QVBoxLayout(box)
-            box_layout.setContentsMargins(10, 6, 10, 6)
+            box_layout.setContentsMargins(12, 8, 12, 8)
+            box_layout.setSpacing(2)
             name_lbl = QtWidgets.QLabel(csig.CHANNEL_LABELS[canonical])
             name_lbl.setProperty("secondaryText", True)
             value_lbl = QtWidgets.QLabel("—")
@@ -2133,7 +2655,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         # anyone off-site or who wants to fall back to SPEC-file-only
         # values (per the user's own "if needed I can check out" note).
         #
-        # IMPORTANT (network-first priority): when checked, all 4 channels
+        # IMPORTANT (network-first priority): when checked, all 5 channels
         # now come from the live signals.chess.cornell.edu reading whenever
         # the network provides one -- overriding the loaded SPEC file's
         # value for that channel, not just filling in gaps. This matters
@@ -2145,19 +2667,44 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self.beam_network_checkbox.setToolTip(
             "On by default -- only finds anything on-site/the CHESS "
             "network, so uncheck this if you're off-site. When checked, "
-            "CESR/IC1/IC2/Diode are read live from "
-            "signals.chess.cornell.edu and that live value overrides the "
-            "loaded SPEC file's value for each channel (falling back to "
-            "the SPEC file's value only if the network request for that "
-            "channel fails or is unreachable). CESR's PV and multiplier "
-            "are less certain than IC1/IC2/Diode's -- worth double-"
-            "checking its live reading against new-status.chess.cornell."
+            "CESR/IC1/IC2/Diode/Energy are read live -- over EPICS Channel "
+            "Access if pyepics is installed and the PV is reachable that "
+            "way, otherwise from signals.chess.cornell.edu -- and that "
+            "live value overrides the loaded SPEC file's value for each "
+            "channel (falling back to the SPEC file's value only if "
+            "neither read succeeds). CESR's and Energy's PVs are less "
+            "certain than IC1/IC2/Diode's -- worth double-checking "
+            "Energy's live reading against the real monochromator "
+            "readout, and CESR's against new-status.chess.cornell."
             "edu/ID4B. Flow Rate (shown below with the temperature "
             "readouts) has no known network PV yet, so it always comes "
             "from the loaded SPEC file's own column regardless of this "
             "checkbox."
         )
         beam_row.addWidget(self.beam_network_checkbox)
+        # "Refresh Energy" -- one-shot EPICS Channel Access read of
+        # ID4B_MON_KEV (see EnergyEpicsFetchThread), fired only when this
+        # button is clicked (plus once automatically at app startup) --
+        # deliberately NOT on every 1s Summary-tab tick, per the user's
+        # explicit request to read Energy "only one time"/"only when
+        # needed". Unlike CESR/IC1/IC2/Diode (HTTP, refreshed every tick,
+        # cheap), Energy only exists over EPICS in this app, and calling
+        # into EPICS from a fresh thread every single tick is what caused
+        # the real on-site regression (repeated caRepeater warnings, GUI
+        # slowness) -- so it's a manual/one-off action here instead.
+        self.refresh_energy_btn = QtWidgets.QPushButton("Refresh Energy")
+        self.refresh_energy_btn.setToolTip(
+            "Reads the live beam Energy (PV ID4B_MON_KEV) once, over EPICS "
+            "Channel Access (requires the optional pyepics package and "
+            "on-site EPICS network access) -- not read automatically on "
+            "every tick, since repeatedly opening a new EPICS connection "
+            "every second is what caused GUI slowdowns/caRepeater warnings "
+            "in an earlier version of this app. Click again any time you "
+            "want an updated reading (e.g. after the monochromator energy "
+            "changes)."
+        )
+        self.refresh_energy_btn.clicked.connect(self._refresh_energy_now)
+        beam_row.addWidget(self.refresh_energy_btn)
         layout.addLayout(beam_row)
 
         # 3 live cryostat temperature readouts (Stage 1 (A), Sample Temp,
@@ -2178,13 +2725,13 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         # request alongside "Beam Condition" above, for the same reason --
         # a clear, explicit label above the row rather than an unlabeled
         # group of cards.
+        layout.addSpacing(6)
         self.temperature_info_header = QtWidgets.QLabel(
             "Temperature Information"
         )
-        self.temperature_info_header.setStyleSheet(
-            "font-size: 11pt; font-weight: bold;"
-        )
+        self.temperature_info_header.setProperty("sectionHeader", True)
         layout.addWidget(self.temperature_info_header)
+        layout.addSpacing(2)
 
         temp_row = QtWidgets.QHBoxLayout()
         self.temperature_signal_labels: Dict[str, QtWidgets.QLabel] = {}
@@ -2196,8 +2743,10 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             )
             box = QtWidgets.QFrame()
             box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            box.setProperty("cardStyle", True)
             box_layout = QtWidgets.QVBoxLayout(box)
-            box_layout.setContentsMargins(10, 6, 10, 6)
+            box_layout.setContentsMargins(12, 8, 12, 8)
+            box_layout.setSpacing(2)
             name_lbl = QtWidgets.QLabel(label_text)
             name_lbl.setProperty("secondaryText", True)
             value_lbl = QtWidgets.QLabel("—")
@@ -2211,6 +2760,53 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
                 self.beam_signal_labels[canonical] = value_lbl
         temp_row.addStretch(1)
         layout.addLayout(temp_row)
+        layout.addSpacing(6)
+
+        # "X-ray Flux" section: a computed Flux reading, using live Energy
+        # (now one of the Beam Condition row's own cards above -- see
+        # csig.CHANNEL_ORDER, chess_signals.BEAM_PV_MAP's "energy" entry,
+        # PV ID4B_MON_KEV) plus live IC1 counts. Energy itself used to have
+        # its own card in this section too, but per the user's explicit
+        # request it now lives in the Beam Condition row instead ("energy
+        # is under same banner of beam condition") -- this section is Flux
+        # only. Flux isn't a raw channel like the others -- it's a
+        # SNAPSHOT, computed once per successful "Refresh Energy" click
+        # (see _snapshot_flux_from_energy(), called from
+        # _on_energy_ready()), not recomputed every 1s tick, per the
+        # user's explicit request that Flux stop changing on its own.
+        # Computed from that refreshed Energy + an IC1 reading taken at
+        # the same moment via ion_chamber_flux.ion_chamber_flux(), using
+        # the gas/method/length/gain for IC1 from
+        # self._flux_chamber_defaults (itself seeded from configs/
+        # qm2.yaml's signals.flux.chambers.ic1, or the hardcoded fallback
+        # if that config failed to load) -- see _build_ion_flux_tab() for
+        # the same calculation exposed as an editable calculator with its
+        # own chamber/gas/method choice.
+        self.xray_flux_header = QtWidgets.QLabel("X-ray Flux")
+        self.xray_flux_header.setProperty("sectionHeader", True)
+        layout.addWidget(self.xray_flux_header)
+        layout.addSpacing(2)
+
+        flux_row = QtWidgets.QHBoxLayout()
+        self.xray_flux_labels: Dict[str, QtWidgets.QLabel] = {}
+        for key, label_text in (("flux", "Flux (IC1)"),):
+            box = QtWidgets.QFrame()
+            box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            box.setProperty("cardStyle", True)
+            box_layout = QtWidgets.QVBoxLayout(box)
+            box_layout.setContentsMargins(12, 8, 12, 8)
+            box_layout.setSpacing(2)
+            name_lbl = QtWidgets.QLabel(label_text)
+            name_lbl.setProperty("secondaryText", True)
+            value_lbl = QtWidgets.QLabel("—")
+            value_lbl.setStyleSheet("font-size: 12pt; font-weight: bold;")
+            box_layout.addWidget(name_lbl)
+            box_layout.addWidget(value_lbl)
+            flux_row.addWidget(box)
+            self.xray_flux_labels[key] = value_lbl
+        flux_row.addStretch(1)
+        layout.addLayout(flux_row)
+        layout.addSpacing(6)
 
         # "No Beam" banner -- hidden by default, shown/hidden every second
         # by _beam_signals_tick() based on csig.is_no_beam(cesr_value).
@@ -2238,25 +2834,644 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         # readout; Slack Alerts is its own self-contained feature that
         # just happens to watch the same no-beam state.
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        # Everything below (SPEC Plot, Pilatus 6M, and Temperature Vs
+        # Time) lives inside ONE outer vertical splitter, so all three
+        # panels resize together proportionally -- dragging the outer
+        # splitter handle (or shrinking the window/tab) shrinks the
+        # temperature plot right along with the SPEC/Pilatus row instead
+        # of leaving it pinned at a fixed height. Per the user's explicit
+        # request: "I don't ever want to make only two plot flexible,
+        # everything should be small if I am trying to make it overall
+        # panel small."
+        outer_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
-        self.summary_plot_panel = PlotPanel()
-        splitter.addWidget(self.summary_plot_panel)
+        top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
 
+        # Wrap the mini plot with a title ("SPEC Plot"), the "actual data"
+        # Peak/FWHM readout, and the plot itself, top to bottom -- the
+        # Peak/FWHM line moved *above* the plot per the user's request
+        # (it used to sit below), and the title is new, also per the
+        # user's request for named panels. Peak/FWHM numbers here are the
+        # same actual-(raw)-data numbers shown in the SPEC Plot tab's left
+        # sidebar (see plot_actual_results_label / _compute_actual_peak),
+        # computed here from the newest scan instead of whatever's
+        # selected in the Plot tab's own Scan/Y combos, kept in sync with
+        # _render_summary_plot()'s own always-live X/Y choice.
+        summary_plot_container = QtWidgets.QWidget()
+        summary_plot_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        summary_plot_layout = QtWidgets.QVBoxLayout(summary_plot_container)
+        summary_plot_layout.setContentsMargins(0, 0, 0, 0)
+        summary_plot_layout.setSpacing(4)
+        spec_plot_title = QtWidgets.QLabel("SPEC Plot")
+        spec_plot_title.setProperty("panelTitle", True)
+        summary_plot_layout.addWidget(spec_plot_title)
+        self.summary_actual_results_label = QtWidgets.QLabel("")
+        self.summary_actual_results_label.setWordWrap(True)
+        self.summary_actual_results_label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        summary_plot_layout.addWidget(self.summary_actual_results_label)
+        self.summary_plot_panel = PlotPanel(show_grid=False)
+        summary_plot_layout.addWidget(self.summary_plot_panel)
+        top_splitter.addWidget(summary_plot_container)
+
+        # Pilatus 6M live image, likewise wrapped with its own title so
+        # both halves of the splitter are clearly labeled.
+        pilatus_container = QtWidgets.QWidget()
+        pilatus_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        pilatus_layout = QtWidgets.QVBoxLayout(pilatus_container)
+        pilatus_layout.setContentsMargins(0, 0, 0, 0)
+        pilatus_layout.setSpacing(4)
+        pilatus_title = QtWidgets.QLabel("Pilatus 6M")
+        pilatus_title.setProperty("panelTitle", True)
+        pilatus_layout.addWidget(pilatus_title)
         self.summary_imv = pg.ImageView()
         self.summary_imv.ui.roiBtn.hide()
         self.summary_imv.ui.menuBtn.hide()
         self.summary_imv.view.invertY(True)
-        splitter.addWidget(self.summary_imv)
+        pilatus_layout.addWidget(self.summary_imv)
+        top_splitter.addWidget(pilatus_container)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter, 1)
+        # Equal stretch factors keep the two sides growing/shrinking
+        # together on resize; the explicit setSizes() call (renormalized
+        # by Qt to whatever width is actually available) is what makes
+        # them start out equal too, since a bare QSplitter otherwise falls
+        # back to each child's own sizeHint() -- and a PlotPanel and a
+        # pg.ImageView don't naturally ask for the same width.
+        top_splitter.setStretchFactor(0, 1)
+        top_splitter.setStretchFactor(1, 1)
+        top_splitter.setSizes([500, 500])
+        outer_splitter.addWidget(top_splitter)
 
         self.live_image_tab.register_mirror(self.summary_imv)
 
+        # "Temperature Vs Time" live history plot -- added per the user's
+        # request, and later moved (per a follow-up request) to sit below
+        # the SPEC mini-plot / Pilatus live-image row above rather than
+        # above it, so it reads as a summary strip under the two main
+        # panels instead of crowding the readout cards at the top. Y axis
+        # is fixed at 0-500K with explicit ticks every 50K (re-applied
+        # every tick in _update_temp_history_plot() so nothing else --
+        # e.g. some other autoRange() call -- can silently override the
+        # range); X axis is minutes elapsed since the app started tracking
+        # (see self._temp_history_start_time, set on the first
+        # _beam_signals_tick()). All 3 cryostat channels (Stage 1 (A),
+        # Sample Temp, Stage 2 (C)) are plotted as separate lines.
+        #
+        # show_grid=False (per the user's "take out the grid" request) and
+        # show_x_in_crosshair=False (per "at the cursor of the temperature
+        # plot should show only Y values" -- the X axis is just elapsed
+        # minutes, and the number worth reading at a glance is the
+        # temperature, not which minute it was at).
+        #
+        # This whole section is wrapped in its own container widget and
+        # added as the SECOND pane of outer_splitter (alongside
+        # top_splitter above) rather than being placed directly in the
+        # tab's own layout -- that's what makes it resize/shrink together
+        # with the SPEC/Pilatus row via the same splitter handle, instead
+        # of being stuck at a fixed height while only the top row was
+        # flexible.
+        temp_container = QtWidgets.QWidget()
+        temp_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        temp_layout = QtWidgets.QVBoxLayout(temp_container)
+        temp_layout.setContentsMargins(0, 0, 0, 0)
+        temp_layout.setSpacing(2)
+
+        self.temp_history_header = QtWidgets.QLabel("Temperature Vs Time")
+        self.temp_history_header.setProperty("sectionHeader", True)
+        temp_layout.addWidget(self.temp_history_header)
+        temp_layout.addSpacing(2)
+
+        # Custom, hand-built legend row (colored swatch + name + live
+        # value, e.g. "● Sample Temp: 300.1 K") instead of relying on
+        # pyqtgraph's built-in LegendItem for this panel. The built-in
+        # legend only ever gets a static name at plot-time and styling it
+        # reliably (readable text color against either theme, especially
+        # Light) turned out to be fragile across pyqtgraph versions; a
+        # plain QLabel row is unambiguous, matches the app's own QSS
+        # theming automatically, and lets each entry show the live value
+        # beside its name per the user's request. self.temp_history_panel's
+        # own pyqtgraph legend is hidden below so the two don't overlap.
+        temp_legend_row = QtWidgets.QHBoxLayout()
+        temp_legend_row.setContentsMargins(4, 0, 4, 0)
+        temp_legend_row.setSpacing(18)
+        self.temp_history_legend_swatches: Dict[str, QtWidgets.QFrame] = {}
+        self.temp_history_legend_labels: Dict[str, QtWidgets.QLabel] = {}
+        for i, canonical in enumerate(csig.TEMPERATURE_ORDER):
+            entry = QtWidgets.QHBoxLayout()
+            entry.setSpacing(6)
+            swatch = QtWidgets.QFrame()
+            swatch.setFixedSize(12, 12)
+            # Fixed color by channel (Stage 1 red / Sample Temp green /
+            # Stage 2 blue), not the generic per-index PLOT_COLORS cycle --
+            # see TEMPERATURE_CURVE_COLORS.
+            swatch.setStyleSheet(
+                f"background-color: {TEMPERATURE_CURVE_COLORS[canonical]}; "
+                "border-radius: 3px;"
+            )
+            entry.addWidget(swatch)
+            name_lbl = QtWidgets.QLabel(f"{csig.TEMPERATURE_LABELS[canonical]}: —")
+            name_lbl.setStyleSheet("font-size: 10pt; font-weight: 600;")
+            entry.addWidget(name_lbl)
+            temp_legend_row.addLayout(entry)
+            self.temp_history_legend_swatches[canonical] = swatch
+            self.temp_history_legend_labels[canonical] = name_lbl
+        temp_legend_row.addStretch(1)
+        temp_layout.addLayout(temp_legend_row)
+        temp_layout.addSpacing(2)
+
+        self.temp_history_panel = PlotPanel(show_grid=False, show_x_in_crosshair=False)
+        # No fixed max-height cap here (there used to be one) -- the panel
+        # now uses an Expanding size policy like the SPEC/Pilatus panels
+        # above, so it grows and shrinks along with the rest of the tab
+        # via outer_splitter instead of staying pinned at a fixed height.
+        # A small minimum height keeps it from collapsing to nothing if
+        # the splitter handle is dragged all the way down.
+        self.temp_history_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        self.temp_history_panel.setMinimumHeight(80)
+        self.temp_history_panel.plot_widget.setLabel("bottom", "Time (minutes)")
+        self.temp_history_panel.plot_widget.setLabel("left", "Temperature (K)")
+        self.temp_history_panel.plot_widget.setYRange(0, 500, padding=0)
+        self.temp_history_panel.plot_widget.getViewBox().disableAutoRange(axis=pg.ViewBox.YAxis)
+        # Explicit ticks every 50K (0, 50, 100, ..., 500) instead of
+        # pyqtgraph's own automatic tick spacing, per the user's request.
+        self.temp_history_panel.plot_widget.getAxis("left").setTicks(
+            [[(v, str(v)) for v in range(0, 501, 50)]]
+        )
+        # Hide the panel's own built-in pyqtgraph legend -- the custom
+        # temp_legend_row above replaces it (see comment there).
+        if self.temp_history_panel.legend is not None:
+            self.temp_history_panel.legend.setVisible(False)
+        self.temp_history_curves: Dict[str, "pg.PlotDataItem"] = {}
+        for canonical in csig.TEMPERATURE_ORDER:
+            color = TEMPERATURE_CURVE_COLORS[canonical]
+            self.temp_history_curves[canonical] = self.temp_history_panel.plot_widget.plot(
+                [], [], pen=pg.mkPen(color=color, width=2)
+            )
+
+        # "Follow live" state -- fixes the "x time is fixed... it is not
+        # going left as the time increase" report. pyqtgraph silently
+        # disables its own auto-ranging on an axis the instant the user
+        # interacts with the view (wheel-zoom, drag-pan, or even this
+        # panel's own zoom in/out buttons), which is what was freezing the
+        # X axis at whatever range it happened to be at when someone last
+        # touched the plot -- every future setData() call in
+        # _update_temp_history_plot() kept drawing new points, but nothing
+        # ever slid the visible window to show them. sigRangeChangedManually
+        # fires ONLY for genuine user-driven pan/zoom (never for our own
+        # programmatic setXRange()/autoRange() calls below), so it's the
+        # right signal to detect "the user took over" -- at that point we
+        # stop re-asserting the range every tick until they click this
+        # panel's own Reset button, which flips the flag back on and lets
+        # the plot resume following the newest data automatically.
+        self._temp_history_panel_follow_live = True
+        self.temp_history_panel.plot_widget.getViewBox().sigRangeChangedManually.connect(
+            lambda _axes: setattr(self, "_temp_history_panel_follow_live", False)
+        )
+        self.temp_history_panel.reset_view_btn.clicked.connect(
+            lambda: setattr(self, "_temp_history_panel_follow_live", True)
+        )
+
+        temp_layout.addWidget(self.temp_history_panel)
+
+        outer_splitter.addWidget(temp_container)
+
+        # Give the SPEC/Pilatus row a bit more of the initial space than
+        # the temperature strip, but both stretch (and shrink) together
+        # from here on since they're both panes of the same splitter --
+        # dragging the handle, or shrinking the Overall Summary tab/
+        # window, resizes all three plots together rather than leaving
+        # the temperature plot fixed while only the top row flexes.
+        outer_splitter.setStretchFactor(0, 2)
+        outer_splitter.setStretchFactor(1, 1)
+        outer_splitter.setSizes([480, 260])
+        layout.addWidget(outer_splitter, 1)
+
         self.summary_tab_widget = w
         self.tabs.addTab(w, "Overall Summary")
+
+    def _build_temperature_tab(self):
+        """Its own dedicated "Temperature" tab -- a full-size, properly
+        zoomable version of the small "Temperature Vs Time" strip on
+        Overall Summary, added per the user's explicit request for "a
+        proper big temperature plot with all the information" plus a grid
+        on/off option and the ability to "zoom properly [to] see the
+        number." Both tabs plot the SAME underlying data
+        (self._temp_history, fed once a second by _record_temp_history()
+        from _beam_signals_tick()) and use the same fixed per-channel
+        colors (TEMPERATURE_CURVE_COLORS: Stage 1 (A) red / Sample Temp
+        green / Stage 2 (C) blue), but this tab is deliberately built
+        differently from the Summary strip in two ways:
+
+        1. No fixed 0-500K Y range / no forced 50K-spaced ticks here (the
+           Summary strip intentionally pins both, via setYRange(...,
+           padding=0) + disableAutoRange() + getAxis("left").setTicks(...),
+           so it always reads at a glance without the numbers jumping
+           around) -- doing that here would fight the user's own zooming,
+           since fixed ticks don't add finer labels when you zoom in. This
+           panel instead behaves like the app's other live-updating plots
+           (e.g. the SPEC Plot tab's own chart, which keeps following the
+           newest scan without undoing a manual zoom): pyqtgraph
+           auto-disables its own auto-ranging the moment the user
+           interacts (drag/wheel/the panel's own zoom in/out/reset
+           buttons), so setData() calls from the shared 1s tick keep the
+           line current without snapping a manual zoom back out, and
+           tick labels are pyqtgraph's own automatic ones, which DO add
+           finer labels as you zoom in -- exactly what "zoom properly...
+           see the number" needs.
+        2. A "Show grid lines" checkbox (self.temperature_tab_grid_chk,
+           default checked, following the same default as the SPEC Plot
+           tab's own "Include grid lines" checkbox) toggles gridlines live
+           via the same _apply_grid_visibility() staticmethod the SPEC
+           Plot tab's grid checkbox already uses.
+
+        The custom Qt-widget legend row (swatch + name + live value, e.g.
+        "Sample Temp: 300.1 K") is the same pattern as Overall Summary's
+        temp_legend_row, just in its own self.temperature_tab_legend_*
+        dicts so the two tabs' widgets don't collide; _record_temp_history()
+        updates both tabs' legend labels each tick, and
+        _update_temp_history_plot() pushes the same data into both tabs'
+        curves each tick -- see those methods.
+
+        Each channel's legend entry also carries a small "Setpoint: — K"
+        label directly below its swatch+name row (self.temperature_tab_
+        setpoint_labels), added per the user's explicit request to show
+        each Lakeshore controller's setpoint here -- display-only, never
+        plotted/curved. Refreshed every tick by _beam_signals_tick() via
+        chess_signals.get_live_setpoint_values() (SETPOINT_PV_MAP:
+        LAKESHORE2:SETP_S1/S2/S3), network-only since a setpoint has no
+        SPEC-file column equivalent. This is Temperature-tab-only -- the
+        Overall Summary strip's own temp_legend_row is unchanged."""
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        header = QtWidgets.QLabel("Temperature Vs Time")
+        header.setProperty("sectionHeader", True)
+        layout.addWidget(header)
+        subtitle = QtWidgets.QLabel(
+            "All 3 cryostat channels, updated live every second. Scroll to "
+            "zoom, drag to pan, or use the buttons below the plot -- "
+            "tick labels refine automatically as you zoom in."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setProperty("secondaryText", True)
+        layout.addWidget(subtitle)
+        layout.addSpacing(4)
+
+        controls_row = QtWidgets.QHBoxLayout()
+        self.temperature_tab_legend_swatches: Dict[str, QtWidgets.QFrame] = {}
+        self.temperature_tab_legend_labels: Dict[str, QtWidgets.QLabel] = {}
+        # Setpoint readouts, added per the user's explicit request: "Update
+        # Temperature set point below Stage 1 (A), Sample Temp, stage2 (c)
+        # line, grab it from EPICS ... you don't have to plot that only
+        # show setpoint value". One extra QLabel per channel, stacked
+        # directly below that channel's existing swatch+name row (hence
+        # entry_col below being a QVBoxLayout instead of the single
+        # QHBoxLayout this used to be) -- these are display-only readouts,
+        # never plotted/curved, fed by chess_signals.get_live_setpoint_values()
+        # (LAKESHORE2:SETP_S1/S2/S3 via EPICS/signals.chess.cornell.edu,
+        # same "Try live network fetch" checkbox and 1s tick as the actual
+        # temperature readings -- see _beam_signals_tick()).
+        self.temperature_tab_setpoint_labels: Dict[str, QtWidgets.QLabel] = {}
+        for canonical in csig.TEMPERATURE_ORDER:
+            entry_col = QtWidgets.QVBoxLayout()
+            entry_col.setSpacing(1)
+            entry = QtWidgets.QHBoxLayout()
+            entry.setSpacing(6)
+            swatch = QtWidgets.QFrame()
+            swatch.setFixedSize(14, 14)
+            swatch.setStyleSheet(
+                f"background-color: {TEMPERATURE_CURVE_COLORS[canonical]}; "
+                "border-radius: 3px;"
+            )
+            entry.addWidget(swatch)
+            name_lbl = QtWidgets.QLabel(f"{csig.TEMPERATURE_LABELS[canonical]}: —")
+            name_lbl.setStyleSheet("font-size: 11pt; font-weight: 600;")
+            entry.addWidget(name_lbl)
+            entry_col.addLayout(entry)
+
+            setpoint_lbl = QtWidgets.QLabel("Setpoint: —")
+            setpoint_lbl.setProperty("secondaryText", True)
+            setpoint_lbl.setStyleSheet("font-size: 9pt; margin-left: 20px;")
+            entry_col.addWidget(setpoint_lbl)
+
+            controls_row.addLayout(entry_col)
+            self.temperature_tab_legend_swatches[canonical] = swatch
+            self.temperature_tab_legend_labels[canonical] = name_lbl
+            self.temperature_tab_setpoint_labels[canonical] = setpoint_lbl
+        controls_row.addStretch(1)
+
+        self.temperature_tab_grid_chk = QtWidgets.QCheckBox("Show grid lines")
+        self.temperature_tab_grid_chk.setChecked(True)
+        self.temperature_tab_grid_chk.toggled.connect(
+            lambda checked: self._apply_grid_visibility(self.temperature_tab_panel, checked)
+        )
+        controls_row.addWidget(self.temperature_tab_grid_chk)
+        layout.addLayout(controls_row)
+        layout.addSpacing(4)
+
+        # show_grid=True here (unlike the Overall Summary strip's
+        # show_grid=False) so the checkbox above starts in sync with the
+        # panel's own initial state; show_x_in_crosshair defaults to True
+        # (also unlike the Summary strip) since on this bigger, properly
+        # zoomable plot, knowing exactly which elapsed-minute you're
+        # hovering is useful, not just the temperature.
+        self.temperature_tab_panel = PlotPanel(show_grid=True)
+        self.temperature_tab_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        self.temperature_tab_panel.plot_widget.setLabel("bottom", "Time (minutes)")
+        self.temperature_tab_panel.plot_widget.setLabel("left", "Temperature (K)")
+        # Hide the panel's own built-in pyqtgraph legend -- the custom
+        # controls_row above replaces it, same reasoning as the Summary
+        # strip's temp_legend_row (readable-text-color styling across
+        # themes plus live values isn't something LegendItem does well).
+        if self.temperature_tab_panel.legend is not None:
+            self.temperature_tab_panel.legend.setVisible(False)
+        self.temperature_tab_curves: Dict[str, "pg.PlotDataItem"] = {}
+        for canonical in csig.TEMPERATURE_ORDER:
+            color = TEMPERATURE_CURVE_COLORS[canonical]
+            self.temperature_tab_curves[canonical] = self.temperature_tab_panel.plot_widget.plot(
+                [], [], pen=pg.mkPen(color=color, width=2)
+            )
+
+        # Same "follow live" fix as the Overall Summary strip (see the
+        # comment in _build_summary_tab() for the full explanation) -- this
+        # is specifically what "I have to reset at the big plot" was
+        # about: once you scroll/pan this tab even a little, pyqtgraph
+        # stops auto-fitting it to new data, so it looked frozen until you
+        # clicked Reset. Now Reset also flips this flag back on, resuming
+        # automatic full X+Y auto-ranging as new points arrive.
+        self._temperature_tab_follow_live = True
+        self.temperature_tab_panel.plot_widget.getViewBox().sigRangeChangedManually.connect(
+            lambda _axes: setattr(self, "_temperature_tab_follow_live", False)
+        )
+        self.temperature_tab_panel.reset_view_btn.clicked.connect(
+            lambda: setattr(self, "_temperature_tab_follow_live", True)
+        )
+
+        layout.addWidget(self.temperature_tab_panel, 1)
+
+        self.temperature_tab_widget = w
+        self.tabs.addTab(w, "Temperature")
+
+    def _build_ion_flux_tab(self):
+        """"Ion Chamber Flux" tab: an interactive calculator wrapping
+        ion_chamber_flux.py's port of the CHESS Ion Chamber Flux
+        Calculator, added per the user's request ("Just add Ion chamber
+        flux tab and in summary page grab energy and flux as well").
+
+        Chamber picks which set of gas/method/length/gain defaults loads
+        into the fields below it: "IC1"/"IC2" load from
+        self._flux_chamber_defaults (itself seeded from configs/qm2.yaml's
+        signals.flux.chambers, or the hardcoded Nitrogen/method 0/6 cm-or-
+        27 cm/1e-6 A/V fallback if that config failed to load), "Custom"
+        leaves whatever is currently in the fields alone so any value can
+        be tried without needing to match a real installed chamber.
+
+        "Follow live values" (checked by default for IC1/IC2, forced off
+        and disabled for Custom) keeps Energy and Counts synced to a
+        SNAPSHOT taken once per successful "Refresh Energy" click -- see
+        _snapshot_flux_from_energy(), called from _on_energy_ready() --
+        rather than continuously every second: Energy from the just-
+        refreshed ID4B_MON_KEV reading, Counts from the selected chamber's
+        own IC1/IC2 reading taken at that same moment. Per the user's
+        explicit request ("I don't need updated flux all the time... if I
+        refresh then energy, then only it will show the flux, not all the
+        time updated"), these fields no longer change on their own between
+        refreshes. Energy/Counts stay directly editable: typing in either
+        field while "Follow live values" is checked just un-checks it, the
+        same pattern the app already uses for its plots' "auto-refresh"/
+        "follow" toggles.
+
+        Recomputes on every change (no separate Calculate button to click)
+        via _recompute_ion_flux_tab(), which also runs once from
+        _snapshot_flux_from_energy() right after a "Follow live values"-
+        driven sync, so the output reflects the new snapshot immediately --
+        but nothing here runs on a timer anymore."""
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        header = QtWidgets.QLabel("Ion Chamber Flux Calculator")
+        header.setProperty("sectionHeader", True)
+        layout.addWidget(header)
+        subtitle = QtWidgets.QLabel(
+            "Port of the CHESS Ion Chamber Flux Calculator (Peter Revesz, "
+            "CHESS) -- current = counts * 10 / 1e6 * gain; flux is that "
+            "current divided by the chosen gas/absorption-mechanism's "
+            "response at the given energy and chamber length, corrected "
+            "for a 1-mil Kapton entrance window. Not independently "
+            "verified against a real ID4B reading in this sandbox."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setProperty("secondaryText", True)
+        layout.addWidget(subtitle)
+        layout.addSpacing(4)
+
+        form = QtWidgets.QFormLayout()
+        form.setSpacing(6)
+
+        self.ion_flux_chamber_combo = QtWidgets.QComboBox()
+        self.ion_flux_chamber_combo.addItems(["IC1", "IC2", "Custom"])
+        form.addRow("Chamber:", self.ion_flux_chamber_combo)
+
+        self.ion_flux_gas_combo = QtWidgets.QComboBox()
+        self.ion_flux_gas_combo.addItems(list(icflux.GASES.keys()))
+        form.addRow("Gas:", self.ion_flux_gas_combo)
+
+        self.ion_flux_method_combo = QtWidgets.QComboBox()
+        self.ion_flux_method_combo.addItems(icflux.METHODS)
+        form.addRow("Absorption mechanism:", self.ion_flux_method_combo)
+
+        self.ion_flux_energy_spin = QtWidgets.QDoubleSpinBox()
+        self.ion_flux_energy_spin.setRange(0.0, 200.0)
+        self.ion_flux_energy_spin.setDecimals(4)
+        self.ion_flux_energy_spin.setSuffix(" keV")
+        self.ion_flux_energy_spin.setValue(10.0)
+        form.addRow("Energy:", self.ion_flux_energy_spin)
+
+        self.ion_flux_counts_spin = QtWidgets.QDoubleSpinBox()
+        self.ion_flux_counts_spin.setRange(0.0, 1e9)
+        self.ion_flux_counts_spin.setDecimals(2)
+        self.ion_flux_counts_spin.setSuffix(" Hz")
+        form.addRow("Counts (rate):", self.ion_flux_counts_spin)
+
+        self.ion_flux_length_spin = QtWidgets.QDoubleSpinBox()
+        self.ion_flux_length_spin.setRange(0.0, 200.0)
+        self.ion_flux_length_spin.setDecimals(2)
+        self.ion_flux_length_spin.setSuffix(" cm")
+        form.addRow("Chamber length:", self.ion_flux_length_spin)
+
+        self.ion_flux_gain_edit = QtWidgets.QLineEdit()
+        self.ion_flux_gain_edit.setPlaceholderText("e.g. 1e-6")
+        self.ion_flux_gain_edit.setToolTip(
+            "Current amplifier range, in A/V (e.g. 1e-6 for a 1 uA/V "
+            "setting)."
+        )
+        form.addRow("Amplifier gain (A/V):", self.ion_flux_gain_edit)
+
+        layout.addLayout(form)
+
+        self.ion_flux_follow_live_chk = QtWidgets.QCheckBox(
+            "Follow live values (Energy + Counts from the Overall Summary "
+            "tab's live readings)"
+        )
+        self.ion_flux_follow_live_chk.setChecked(True)
+        layout.addWidget(self.ion_flux_follow_live_chk)
+        layout.addSpacing(4)
+
+        results_header = QtWidgets.QLabel("Result")
+        results_header.setProperty("sectionHeader", True)
+        layout.addWidget(results_header)
+
+        results_row = QtWidgets.QHBoxLayout()
+        self.ion_flux_result_labels: Dict[str, QtWidgets.QLabel] = {}
+        for key, label_text in (
+            ("flux", "Flux (ph/s)"),
+            ("current", "Current (A)"),
+            ("transmission", "Transmission"),
+            ("a_gas", "a_gas (cm\u00b2/g)"),
+            ("a_gas_cm", "a_gas (1/cm)"),
+        ):
+            box = QtWidgets.QFrame()
+            box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            box.setProperty("cardStyle", True)
+            box_layout = QtWidgets.QVBoxLayout(box)
+            box_layout.setContentsMargins(12, 8, 12, 8)
+            box_layout.setSpacing(2)
+            name_lbl = QtWidgets.QLabel(label_text)
+            name_lbl.setProperty("secondaryText", True)
+            value_lbl = QtWidgets.QLabel("—")
+            value_lbl.setStyleSheet("font-size: 12pt; font-weight: bold;")
+            box_layout.addWidget(name_lbl)
+            box_layout.addWidget(value_lbl)
+            results_row.addWidget(box)
+            self.ion_flux_result_labels[key] = value_lbl
+        results_row.addStretch(1)
+        layout.addLayout(results_row)
+
+        self.ion_flux_error_label = QtWidgets.QLabel("")
+        self.ion_flux_error_label.setWordWrap(True)
+        self.ion_flux_error_label.setStyleSheet("color: #cc3333;")
+        layout.addWidget(self.ion_flux_error_label)
+        layout.addStretch(1)
+
+        # Chamber choice loads that chamber's config-supplied defaults
+        # (gas/method/length/gain) into the editable fields; typing in
+        # Energy/Counts while "Follow live values" is checked un-checks it
+        # (same "editing turns off auto-follow" pattern as the temperature
+        # plots' follow-live flags), so a manually-typed value never gets
+        # silently overwritten by the next 1s tick.
+        self.ion_flux_chamber_combo.currentTextChanged.connect(self._on_ion_flux_chamber_changed)
+        self.ion_flux_energy_spin.valueChanged.connect(self._on_ion_flux_manual_edit)
+        self.ion_flux_counts_spin.valueChanged.connect(self._on_ion_flux_manual_edit)
+        self.ion_flux_gas_combo.currentTextChanged.connect(lambda *_: self._recompute_ion_flux_tab())
+        self.ion_flux_method_combo.currentTextChanged.connect(lambda *_: self._recompute_ion_flux_tab())
+        self.ion_flux_gain_edit.textChanged.connect(lambda *_: self._recompute_ion_flux_tab())
+        self.ion_flux_length_spin.valueChanged.connect(lambda *_: self._recompute_ion_flux_tab())
+
+        self._on_ion_flux_chamber_changed("IC1")
+
+        self.ion_flux_tab_widget = w
+        self.tabs.addTab(w, "Ion Chamber Flux")
+
+    def _on_ion_flux_chamber_changed(self, chamber_text: str):
+        """Loads the chosen chamber's gas/method/length/gain defaults
+        (from self._flux_chamber_defaults, i.e. configs/qm2.yaml or the
+        hardcoded fallback) into the Ion Chamber Flux tab's fields.
+        "Custom" leaves the fields as they are so any combination can be
+        tried; IC1/IC2 also re-enables "Follow live values" (it's forced
+        off/disabled for Custom, since there's no live reading to follow
+        for a chamber that isn't IC1 or IC2)."""
+        key = chamber_text.strip().lower()
+        follow_chk = getattr(self, "ion_flux_follow_live_chk", None)
+        if key in ("ic1", "ic2"):
+            defaults = self._flux_chamber_defaults.get(key, {})
+            gas = defaults.get("gas", "Nitrogen")
+            idx = self.ion_flux_gas_combo.findText(gas)
+            if idx >= 0:
+                self.ion_flux_gas_combo.setCurrentIndex(idx)
+            method_idx = int(defaults.get("method", 0))
+            if 0 <= method_idx < self.ion_flux_method_combo.count():
+                self.ion_flux_method_combo.setCurrentIndex(method_idx)
+            self.ion_flux_length_spin.setValue(float(defaults.get("length_cm", 6.0)))
+            self.ion_flux_gain_edit.setText(str(defaults.get("gain_a_per_v", 1e-6)))
+            if follow_chk is not None:
+                follow_chk.setEnabled(True)
+        else:
+            if follow_chk is not None:
+                follow_chk.setChecked(False)
+                follow_chk.setEnabled(False)
+        self._recompute_ion_flux_tab()
+
+    def _on_ion_flux_manual_edit(self, *_args):
+        """Typing directly into Energy or Counts un-checks "Follow live
+        values" (if it was on) so the next Energy-refresh snapshot (see
+        _snapshot_flux_from_energy()) doesn't immediately overwrite the
+        value just typed -- same pattern as the app's other follow-live
+        toggles (e.g. the Temperature tab's pan/zoom vs. Reset)."""
+        follow_chk = getattr(self, "ion_flux_follow_live_chk", None)
+        if follow_chk is not None and follow_chk.isChecked() and follow_chk.isEnabled():
+            follow_chk.blockSignals(True)
+            follow_chk.setChecked(False)
+            follow_chk.blockSignals(False)
+        self._recompute_ion_flux_tab()
+
+    def _recompute_ion_flux_tab(self):
+        """Runs ion_chamber_flux.ion_chamber_flux() with whatever is
+        currently in the Ion Chamber Flux tab's fields and fills in the
+        Result cards -- called on every field edit, on chamber change, and
+        once a second from _beam_signals_tick() while "Follow live
+        values" is checked (which also refreshes Energy/Counts from the
+        live readings first, see that method)."""
+        labels = getattr(self, "ion_flux_result_labels", None)
+        error_lbl = getattr(self, "ion_flux_error_label", None)
+        if labels is None:
+            return
+        try:
+            gas = self.ion_flux_gas_combo.currentText()
+            method = self.ion_flux_method_combo.currentIndex()
+            gain = float(self.ion_flux_gain_edit.text() or "0")
+            result = icflux.ion_chamber_flux(
+                gas=gas,
+                method=method,
+                e_ion=icflux.GASES[gas]["e_ion"],
+                density=icflux.GASES[gas]["density"],
+                energy_ev=icflux.energy_to_ev(self.ion_flux_energy_spin.value(), "keV"),
+                length_cm=self.ion_flux_length_spin.value(),
+                counts=self.ion_flux_counts_spin.value(),
+                gain=gain,
+            )
+            labels["flux"].setText(f"{result['flux']:.4e}")
+            labels["current"].setText(f"{result['current']:.4e}")
+            labels["transmission"].setText(f"{result['transmission']:.4f}")
+            labels["a_gas"].setText(f"{result['a_gas']:.4e}")
+            labels["a_gas_cm"].setText(f"{result['a_gas_cm']:.4e}")
+            if error_lbl is not None:
+                lo, hi = icflux.VALID_RANGE_EV
+                e_ev = icflux.energy_to_ev(self.ion_flux_energy_spin.value(), "keV")
+                if not (lo <= e_ev <= hi):
+                    error_lbl.setText(
+                        f"Note: energy is outside the calculator's validated "
+                        f"{lo/1000:.0f}-{hi/1000:.0f} keV range -- result may be unreliable."
+                    )
+                else:
+                    error_lbl.setText("")
+        except Exception as exc:
+            for lbl in labels.values():
+                lbl.setText("—")
+            if error_lbl is not None:
+                error_lbl.setText(f"Calculation failed: {exc}")
 
     def _build_slack_alerts_tab(self):
         """Its own tab (moved out of Overall Summary per the user's
@@ -2375,6 +3590,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             self.current_browse_path = path
             self.root_edit.setText(path)
             self._refresh_file_tree()
+            self._auto_load_newest_in_browse_folder()
 
     def _on_root_edit_go(self):
         path = self.root_edit.text().strip()
@@ -2382,8 +3598,32 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             self.root_path = path
             self.current_browse_path = path
             self._refresh_file_tree()
+            self._auto_load_newest_in_browse_folder()
         else:
             QtWidgets.QMessageBox.warning(self, "Invalid Path", f"Not a valid directory:\n{path}")
+
+    def _auto_load_newest_in_browse_folder(self):
+        """After the user points the file browser at a folder (Set Root
+        Folder dialog, or typing a path + Go), immediately load whichever
+        SPEC file in it has the newest modification time, instead of just
+        populating the tree and waiting for a manual double-click.
+
+        This also fixes the Live Image (Pilatus) tab -- and, via its
+        mirror, the Overall Summary tab's live image -- not getting
+        pointed at the right image folder on a plain folder selection:
+        that wiring only happens inside load_file() via
+        _auto_link_live_image_folder(), which previously never ran until
+        the user manually double-clicked a file in the tree. Mirrors the
+        same "pick the newest spec file" logic already used by
+        _check_for_new_spec_file() (the Auto-detect new file feature)."""
+        try:
+            items = sc.list_directory(self.current_browse_path)
+        except Exception:
+            return
+        newest = next((it for it in items if it.get("type") == "spec_file"), None)
+        if newest is None:
+            return
+        self.load_file(newest["path"])
 
     def _refresh_file_tree(self):
         self.file_tree.clear()
@@ -2457,6 +3697,16 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             self.autorefresh_chk.blockSignals(True)
             self.autorefresh_chk.setChecked(False)
             self.autorefresh_chk.blockSignals(False)
+        # Same reasoning as Auto-Refresh above: sample data has no real
+        # on-disk file/folder to watch, and leaving this on would just
+        # immediately auto-load whatever's newest in the last Browse
+        # folder the moment the next 5s tick runs -- silently undoing the
+        # "look at sample data" the user just asked for.
+        self._new_file_watch_timer.stop()
+        if getattr(self, "new_file_detect_chk", None) and self.new_file_detect_chk.isChecked():
+            self.new_file_detect_chk.blockSignals(True)
+            self.new_file_detect_chk.setChecked(False)
+            self.new_file_detect_chk.blockSignals(False)
 
     def reload_file(self):
         if not self._loaded_file_path:
@@ -2577,6 +3827,81 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             self._watch_mtime = mtime
 
     # ------------------------------------------------------------------
+    # Auto-detect new SPEC file (folder-level: notices when SPEC starts
+    # writing to a DIFFERENT file, not just growth of the currently
+    # loaded one -- see _new_file_watch_timer's setup comment in
+    # __init__ for how this differs from _watch_timer/_autorefresh_timer
+    # above, both of which only ever watch the single already-loaded path)
+    # ------------------------------------------------------------------
+    def _on_new_file_detect_toggled(self, checked: bool):
+        if checked:
+            self._new_file_watch_timer.start()
+            # Run one check immediately rather than waiting up to 5s for
+            # the first tick, so turning this on visibly does something
+            # right away if a newer file is already sitting there.
+            self._check_for_new_spec_file()
+            self.status_label.setText(
+                "Auto-detect new SPEC file enabled — watching the folder "
+                "for a newer file to appear."
+            )
+        else:
+            self._new_file_watch_timer.stop()
+            self.status_label.setText("Auto-detect new SPEC file disabled.")
+
+    def _check_for_new_spec_file(self):
+        """Scan the watched folder for whichever SPEC file currently has
+        the newest modification time, and load_file() it if that's not
+        already what's loaded. The watched folder is the currently loaded
+        file's own directory if one is loaded (so this follows wherever
+        the active experiment folder actually is), falling back to
+        self.current_browse_path (the file-tree's folder) if nothing's
+        loaded yet -- so turning this on before ever loading anything
+        still picks up the newest file in whatever folder is being
+        browsed. Uses sc.list_directory(), which already sniffs/sorts
+        SPEC files by mtime (newest first) the same way the file-tree
+        itself does, so "new file" detection uses the exact same
+        extension/name/content heuristics as everywhere else in the app
+        rather than a separate, possibly-inconsistent set of rules."""
+        if not getattr(self, "new_file_detect_chk", None) or not self.new_file_detect_chk.isChecked():
+            return
+        if self._loaded_file_path:
+            folder = os.path.dirname(self._loaded_file_path)
+        else:
+            folder = self.current_browse_path
+        if not folder or not os.path.isdir(folder):
+            return
+        try:
+            items = sc.list_directory(folder)
+        except Exception:
+            return
+        newest = next((it for it in items if it.get("type") == "spec_file"), None)
+        if newest is None:
+            return
+        newest_path = newest["path"]
+        if newest_path == self._loaded_file_path:
+            return
+        if self._loaded_file_path:
+            try:
+                current_mtime = os.stat(self._loaded_file_path).st_mtime
+            except OSError:
+                current_mtime = -1.0
+            try:
+                new_mtime = os.stat(newest_path).st_mtime
+            except OSError:
+                return
+            # Only switch to a file that's genuinely newer than what's
+            # loaded now -- otherwise an older-but-different file sitting
+            # in the same folder (e.g. a reference file someone loaded by
+            # hand) would get silently swapped in just for existing.
+            if new_mtime <= current_mtime:
+                return
+        self.load_file(newest_path)
+        self.status_label.setText(
+            f"Auto-detected new SPEC file: {os.path.basename(newest_path)} "
+            f"— switched automatically."
+        )
+
+    # ------------------------------------------------------------------
     # Auto-Refresh (matches the web dashboard's Auto-Refresh feature:
     # interval polling, automatic reload, and automatic re-plot of the
     # latest scan — not just a passive "file changed" notice)
@@ -2649,22 +3974,75 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             return
         if self._watch_mtime is not None and mtime <= self._watch_mtime:
             return
-        try:
-            df, columns, metadata, scan_info = sc.load_spec_file(self._loaded_file_path)
-        except Exception as exc:
-            self.status_label.setText(f"Auto-refresh: failed to reload file ({exc})")
+        # Reparse happens in the background now (see SpecFileLoader) --
+        # this just requests it. self._watch_mtime isn't bumped until the
+        # load actually finishes (_on_background_file_loaded), so ticks
+        # that land while a reparse is still in flight harmlessly keep
+        # re-requesting the same mtime; _kick_off_background_reload()'s
+        # isRunning() guard is what stops that from piling up duplicate
+        # reparses.
+        self._kick_off_background_reload(mtime)
+
+    def _kick_off_background_reload(self, mtime: float) -> bool:
+        """Start a background SpecFileLoader for the currently-loaded file,
+        unless one is already in flight. Returns True if a load was
+        actually started. See SpecFileLoader's docstring for why this
+        exists instead of calling sc.load_spec_file() directly here."""
+        if self._file_loader_thread is not None and self._file_loader_thread.isRunning():
+            return False
+        if not self._loaded_file_path:
+            return False
+        loader = SpecFileLoader(self._loaded_file_path, mtime)
+        loader.loaded.connect(self._on_background_file_loaded)
+        loader.failed.connect(self._on_background_file_load_failed)
+        self._file_loader_thread = loader
+        loader.start()
+        return True
+
+    def _on_background_file_loaded(self, df, columns, metadata, scan_info, path, mtime, elapsed_seconds):
+        """Main-thread slot: runs once a background SpecFileLoader finishes
+        re-reading+parsing `path`. Shared by whichever tick (Auto-Refresh
+        or the Summary tab) requested the reload."""
+        if path != self._loaded_file_path:
+            # The user pointed the app at a different file while this load
+            # was still in flight -- it's stale now, discard it rather
+            # than clobbering whatever's already loaded.
             return
-        label = os.path.basename(self._loaded_file_path)
-        self._apply_loaded_data(df, columns, metadata, scan_info, label)
         self._watch_mtime = mtime
+        self._summary_watch_mtime = mtime
+        self._last_reload_seconds = elapsed_seconds
+        label = os.path.basename(path)
+        self._apply_loaded_data(df, columns, metadata, scan_info, label)
         self._replot_latest_scan()
-        self.status_label.setText(f"Auto-refresh: reloaded {label} and re-plotted the latest scan.")
+        # elapsed_seconds is the background thread's own wall-clock time for
+        # the read+parse -- shown so a slow reload's cause (big/slow file,
+        # vs. e.g. a network-mounted file being read from a different
+        # machine than the one writing it) is visible at a glance instead
+        # of just "it feels slow" (see SpecFileLoader's docstring).
+        self.status_label.setText(
+            f"Auto-refresh: reloaded {label} and re-plotted the latest scan "
+            f"(reload took {elapsed_seconds:.1f}s)."
+        )
+
+    def _on_background_file_load_failed(self, message: str, elapsed_seconds: float):
+        self.status_label.setText(
+            f"Auto-refresh: failed to reload file after {elapsed_seconds:.1f}s ({message})"
+        )
 
     def _replot_latest_scan(self):
-        """Jump to the SPEC Plot tab and render only the most recent scan,
-        mirroring the web dashboard's auto-refresh behavior."""
+        """Render only the most recent scan, mirroring the web dashboard's
+        auto-refresh behavior. If the user is currently sitting on the
+        Overall Summary tab, stay there — that tab has its own always-live
+        mini plot (_render_summary_plot(), driven by _summary_timer) that
+        already tracks the newest scan, so jumping to SPEC Plot on every
+        refresh would just yank the user away from what they're looking
+        at. Only navigate to SPEC Plot when some other tab is active,
+        matching the pre-existing behavior for every tab except Summary."""
         scan_numbers = self._scan_numbers_for(self.df)
         if not scan_numbers:
+            return
+        if self.tabs.currentWidget() is getattr(self, "summary_tab_widget", None):
+            self._render_summary_plot()
             return
         self._goto_tab("SPEC Plot")
         # Snapshot whatever curve(s) are still on screen from *before* this
@@ -2784,6 +4162,8 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         features_grid.setVerticalSpacing(8)
         feature_items = [
             ("Overall Summary", "At-a-glance Beam Condition (CESR/IC1 (Ion Chamber 1)/IC2 (Ion Chamber 2)/Diode) and Temperature Information (Stage 1 (A)/Sample Temp/Stage 2 (C)/Flow Rate) readouts, refreshed live, with a dark-red No Beam banner when CESR reads near zero — plus a mini plot that always follows the latest scan."),
+            ("Temperature", "A full-size, freely zoomable version of the Temperature Vs Time plot (Stage 1 (A) red / Sample Temp green / Stage 2 (C) blue), with a live-value legend and a grid on/off checkbox — for a closer look than the small strip on Overall Summary."),
+            ("Ion Chamber Flux", "Calculator for X-ray flux from ion chamber counts (ported from the CHESS Ion Chamber Flux Calculator) — pick IC1/IC2/Custom, gas, and absorption mechanism; Energy and Counts can follow the same live readings shown on Overall Summary (Energy from the Beam Condition row, Counts from IC1/IC2), or be typed in by hand."),
             ("SPEC Plot", "Pick X/Y columns, overlay multiple scans, switch line/scatter/line+scatter/bar, normalize, or use log scale. Sensible defaults are picked automatically when you load a file. Optionally overlay a Gaussian or Lorentzian peak fit (via SciPy), a scan from a separately-loaded reference file, or — during Auto-Refresh — the previous plot as a ghost overlay for quick before/after comparison. Save or copy the chart itself as a PNG image."),
             ("Live Image (Pilatus)", "Watch a folder of .cbf detector frames and see the newest one update in real time, with colormap choices and an optional ROI monitor."),
             ("Folder Timeline", "Every scan across every SPEC file in a folder, sorted chronologically, with a data-folder lookup and a downloadable PDF experiment summary."),
@@ -3640,14 +5020,19 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
     # Summary tab (always-live watch-only view)
     # ------------------------------------------------------------------
     def _summary_refresh_tick(self):
-        """Runs every 0.1s while the Summary tab is visible. Re-reads the
-        currently loaded SPEC file from disk if it's changed since the
-        last tick (tracked via its own self._summary_watch_mtime, kept
-        separate from the Plot tab's Auto-Refresh/watch timers so the two
-        features can't race each other), then always re-renders the
-        latest-scan plot -- even on ticks where the file didn't change --
-        so picking up a newer selection on the Plot tab (last_plot_info)
-        shows up here within 0.1s too."""
+        """Runs every 0.1s while the Summary tab is visible. If the
+        currently loaded SPEC file has changed on disk since the last tick
+        (tracked via its own self._summary_watch_mtime), REQUESTS a
+        background reparse (see SpecFileLoader / _kick_off_background_
+        reload -- the actual reparse never runs inline on this timer
+        anymore, since a synchronous reparse here used to be exactly what
+        made this tab feel like it updated every ~10s instead of every
+        0.1s on any file of real size). Either way, always re-renders the
+        latest-scan plot from whatever's already loaded -- even on ticks
+        where the file didn't change -- so picking up a newer selection on
+        the Plot tab (last_plot_info) shows up here within 0.1s too, and
+        this redraw itself stays cheap/instant regardless of how long a
+        reparse might be taking in the background."""
         if self._loaded_file_path:
             try:
                 mtime = os.stat(self._loaded_file_path).st_mtime
@@ -3656,14 +5041,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             if mtime is not None and (
                 self._summary_watch_mtime is None or mtime > self._summary_watch_mtime
             ):
-                try:
-                    df, columns, metadata, scan_info = sc.load_spec_file(self._loaded_file_path)
-                except Exception:
-                    pass
-                else:
-                    self._summary_watch_mtime = mtime
-                    label = os.path.basename(self._loaded_file_path)
-                    self._apply_loaded_data(df, columns, metadata, scan_info, label)
+                self._kick_off_background_reload(mtime)
         self._render_summary_plot()
 
     # ------------------------------------------------------------------
@@ -3816,6 +5194,234 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         else:
             self.slack_status_label.setText(f"❌ Alert failed at {stamp}: {detail}")
 
+    def _refresh_energy_now(self):
+        """Fire a single one-shot EnergyEpicsFetchThread to read the live
+        beam Energy (PV ID4B_MON_KEV) over EPICS Channel Access. Called
+        once automatically at app startup (see __init__) and again every
+        time the user clicks the "Refresh Energy" button -- deliberately
+        NEVER from the 1s _beam_signals_timer tick, per the user's
+        explicit request to read Energy "only one time"/"only when
+        needed" rather than continuously (see EnergyEpicsFetchThread's
+        docstring for the on-site regression this avoids).
+
+        Guards against piling up more than one fetch at a time using the
+        plain `self._energy_fetch_in_progress` bool (see __init__'s
+        comment for why this is not `self._energy_fetch_thread.
+        isRunning()`) -- if a previous fetch is still running (e.g. the
+        user double-clicks, or EPICS is slow to respond) this just
+        returns without starting a second one; the button is disabled
+        meanwhile so that's also visible in the UI, not just silent."""
+        if self._energy_fetch_in_progress:
+            return
+        self._energy_fetch_in_progress = True
+        btn = getattr(self, "refresh_energy_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("Refreshing…")
+        thread = EnergyEpicsFetchThread()
+        thread.energy_ready.connect(self._on_energy_ready)
+        thread.diagnostic_ready.connect(self._on_energy_diagnostic)
+        thread.finished.connect(self._on_energy_fetch_thread_finished)
+        self._energy_fetch_thread = thread
+        thread.start()
+
+    def _on_energy_diagnostic(self, text: str):
+        """Slot for EnergyEpicsFetchThread.diagnostic_ready. Just prints a
+        one-line diagnostic to stdout (terminal running this GUI) --
+        pyepics-importable?, the EPICS_CA_* env vars this process actually
+        sees, and the raw caget() reply/exception -- so a connect failure
+        that happens even though `caget` works fine at a real on-site
+        terminal can be compared directly against that terminal's
+        environment, rather than guessed at. Deliberately just a print(),
+        not a new log widget: this app already gets debugged by pasting
+        its terminal output back for review, so this is the lowest-friction
+        place to put it."""
+        print(f"[EnergyEpicsFetchThread] {text}", flush=True)
+
+    def _on_energy_fetch_thread_finished(self):
+        """Slot for EnergyEpicsFetchThread.finished. Clears
+        self._energy_fetch_thread and self._energy_fetch_in_progress
+        BEFORE scheduling the QThread object itself for deletion (via
+        deleteLater()) -- this ordering matters: a real on-site run
+        showed that connecting `finished` straight to `thread.deleteLater`
+        and then separately checking `self._energy_fetch_thread.
+        isRunning()` on the next click could hit a QThread whose
+        underlying C++ object had already been destroyed, raising
+        "RuntimeError: wrapped C/C++ object of type EnergyEpicsFetchThread
+        has been deleted" and silently breaking every "Refresh Energy"
+        click after the first. Clearing our own references here first
+        means _refresh_energy_now() never touches the (possibly-deleted)
+        thread object again."""
+        self._energy_fetch_in_progress = False
+        thread = self._energy_fetch_thread
+        self._energy_fetch_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def _on_energy_ready(self, value):
+        """Slot for EnergyEpicsFetchThread.energy_ready -- runs on the Qt
+        main thread (Qt marshals cross-thread signals automatically), so
+        it's safe to touch widgets here directly. Caches the result (float
+        or None) for _beam_signals_tick() to pick up on its very next 1s
+        tick, re-enables the "Refresh Energy" button, and immediately
+        surfaces a failed/empty read (via both the status bar and the
+        Energy card's tooltip) rather than leaving it silently at "—" with
+        no explanation.
+
+        On a SUCCESSFUL read, this is also the one and only place Flux
+        gets (re)computed: see _snapshot_flux_from_energy(), called at the
+        bottom of this method. Flux is deliberately a snapshot taken right
+        here, once per Energy refresh, rather than something
+        _beam_signals_tick() keeps recomputing every second -- per the
+        user's explicit request that Flux should stop changing on its own
+        and only update when they refresh Energy.
+
+        The failure message below reflects a confirmed on-site root cause,
+        not just a generic "unreachable" guess: running the plain `caget
+        ID4B_MON_KEV` CLI directly on lnx306 (no Python/GUI involved at
+        all) produced the exact same "Channel connect timed out ... not
+        found" failure as this thread's own epics.caget() call -- while
+        the same PV reads fine from the `id4b` host. Two earlier, more
+        specific theories (a missing/misconfigured CA Repeater on $PATH,
+        and a libca.so version mismatch) were each investigated and ruled
+        out on-site before reaching this conclusion (see
+        EnergyEpicsFetchThread's own docstring for that history). Since a
+        bare CLI call fails identically outside of any Python process,
+        this is a genuine network reachability limitation of whatever
+        host the GUI happens to be running on (most likely: EPICS
+        Channel Access relies on UDP broadcast for PV search, and
+        broadcasts typically don't cross subnet/VLAN boundaries) --
+        nothing in this codebase can fix that from inside the process."""
+        self._live_energy_value = value
+        btn = getattr(self, "refresh_energy_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("Refresh Energy")
+        if value is None:
+            msg = (
+                "Energy refresh failed -- could not read ID4B_MON_KEV over "
+                "EPICS Channel Access. Confirmed on-site: a plain `caget "
+                "ID4B_MON_KEV` also fails from this same host (lnx306), "
+                "while it succeeds from id4b -- so this is a network "
+                "reachability limitation of this host, not a bug in this "
+                "app. Workaround: uncheck \"Follow live values\" on the Ion "
+                "Chamber Flux tab and type the Energy in manually -- Flux "
+                "will still compute from that value."
+            )
+            status_lbl = getattr(self, "status_label", None)
+            if status_lbl is not None:
+                status_lbl.setText(msg)
+            lbl = getattr(self, "beam_signal_labels", {}).get("energy")
+            if lbl is not None:
+                lbl.setToolTip(msg)
+            # Deliberately NOT touching Flux/self._live_flux_snapshot here:
+            # a failed refresh leaves the last good Flux snapshot on
+            # screen rather than wiping it to "—" over a transient/
+            # network-reachability failure -- see _snapshot_flux_from_
+            # energy()'s docstring.
+        else:
+            status_lbl = getattr(self, "status_label", None)
+            if status_lbl is not None:
+                status_lbl.setText(f"Energy refreshed: {value:,.3f} keV (ID4B_MON_KEV).")
+            self._snapshot_flux_from_energy(value)
+
+    def _snapshot_flux_from_energy(self, energy_value: float):
+        """Takes a ONE-TIME snapshot of Flux -- both the Overall Summary
+        tab's "Flux (IC1)" card and, if "Follow live values" is checked,
+        the Ion Chamber Flux tab's Energy/Counts fields -- using the
+        Energy value that was just successfully refreshed plus a fresh
+        IC1 (and, for the Ion tab, whichever chamber is currently
+        selected there) reading taken at this same moment. Called only
+        from _on_energy_ready() right after a successful Energy refresh
+        (including the automatic one at startup) -- never from the 1s
+        _beam_signals_timer tick.
+
+        Before this method existed, Flux was recomputed every single tick
+        in _beam_signals_tick() from Energy (itself already refresh-only,
+        cached in self._live_energy_value) plus a CONTINUOUSLY-live IC1
+        reading -- so the Flux number, and with "Follow live values"
+        checked the Ion Chamber Flux tab's own Energy/Counts fields, kept
+        changing every second even though Energy only ever changed on a
+        manual "Refresh Energy" click. Per the user's explicit request ("I
+        don't need updated flux all the time... if I refresh then energy,
+        then only it will show the flux, not all the time updated" /
+        "realtime updated version not need" / "only once during refresh"),
+        Flux is now this snapshot instead: it only updates immediately
+        after a Refresh Energy click, and otherwise just keeps showing
+        whatever it last showed -- _beam_signals_tick() no longer touches
+        Flux or these Ion-tab fields at all.
+
+        self._live_flux_snapshot caches the result (or None if IC1 had no
+        live reading at this moment, or the calculation itself failed) so
+        nothing else needs to re-derive it."""
+        use_network = bool(
+            getattr(self, "beam_network_checkbox", None)
+            and self.beam_network_checkbox.isChecked()
+        )
+        values = csig.get_live_beam_values(self.df, self.columns, use_network=use_network)
+
+        # Summary tab's "Flux (IC1)" card -- always IC1 specifically, same
+        # chamber this card always used before this change.
+        flux_lbl = getattr(self, "xray_flux_labels", {}).get("flux")
+        ic1_value = (values.get("ic1") or {}).get("value")
+        if flux_lbl is not None:
+            if ic1_value is None:
+                flux_lbl.setText("—")
+                flux_lbl.setToolTip(
+                    "Needs a live IC1 reading at the moment Energy was "
+                    "refreshed -- none was available just now. Click "
+                    "\"Refresh Energy\" again to retry."
+                )
+                self._live_flux_snapshot = None
+            else:
+                chamber = self._flux_chamber_defaults.get("ic1", {})
+                try:
+                    result = icflux.ion_chamber_flux(
+                        gas=chamber.get("gas", "Nitrogen"),
+                        method=int(chamber.get("method", 0)),
+                        e_ion=icflux.GASES[chamber.get("gas", "Nitrogen")]["e_ion"],
+                        density=icflux.GASES[chamber.get("gas", "Nitrogen")]["density"],
+                        energy_ev=icflux.energy_to_ev(energy_value, "keV"),
+                        length_cm=float(chamber.get("length_cm", 6.0)),
+                        counts=ic1_value,
+                        gain=float(chamber.get("gain_a_per_v", 1e-6)),
+                    )
+                    flux_lbl.setText(f"{result['flux']:.3e} ph/s")
+                    flux_lbl.setToolTip(
+                        f"Snapshot at last Refresh Energy: Energy={energy_value:,.3f} keV, "
+                        f"IC1={ic1_value:,.2f}, gas={chamber.get('gas')}, "
+                        f"length={chamber.get('length_cm')} cm, "
+                        f"gain={chamber.get('gain_a_per_v')} A/V "
+                        "(configs/qm2.yaml signals.flux.chambers.ic1, or fallback "
+                        "defaults) -- click \"Refresh Energy\" again to update. "
+                        "See the Ion Chamber Flux tab to recompute with different "
+                        "inputs."
+                    )
+                    self._live_flux_snapshot = {
+                        "energy": energy_value, "ic1": ic1_value, "result": result,
+                    }
+                except Exception as exc:
+                    flux_lbl.setText("—")
+                    flux_lbl.setToolTip(f"Flux calculation failed: {exc}")
+                    self._live_flux_snapshot = None
+
+        # Ion Chamber Flux tab: only sync Energy/Counts from this same
+        # snapshot if "Follow live values" is checked -- a manually-typed
+        # value is left alone (that's what unchecks the box in the first
+        # place, see _on_ion_flux_manual_edit()).
+        follow_chk = getattr(self, "ion_flux_follow_live_chk", None)
+        if follow_chk is not None and follow_chk.isChecked() and follow_chk.isEnabled():
+            chamber_key = self.ion_flux_chamber_combo.currentText().strip().lower()
+            chamber_value = (values.get(chamber_key) or {}).get("value")
+            self.ion_flux_energy_spin.blockSignals(True)
+            self.ion_flux_energy_spin.setValue(energy_value)
+            self.ion_flux_energy_spin.blockSignals(False)
+            if chamber_value is not None:
+                self.ion_flux_counts_spin.blockSignals(True)
+                self.ion_flux_counts_spin.setValue(chamber_value)
+                self.ion_flux_counts_spin.blockSignals(False)
+            self._recompute_ion_flux_tab()
+
     def _beam_signals_tick(self):
         """Runs every 1s while the Summary tab is visible. Reads the live
         beam-monitor values (CESR, IC1, IC2, diode, Flow Rate) via
@@ -3865,12 +5471,47 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         can't affect beam-channel matching. Flow Rate's card sits visually
         in this same row (see _build_summary_tab()), but it's refreshed by
         the beam-values loop above it, not this temperature loop, since
-        its value still comes from get_live_beam_values()."""
+        its value still comes from get_live_beam_values().
+
+        Also refreshes the 3 Lakeshore setpoint readouts on the dedicated
+        Temperature tab (self.temperature_tab_setpoint_labels), via
+        chess_signals.get_live_setpoint_values() (SETPOINT_PV_MAP:
+        LAKESHORE2:SETP_S1/S2/S3) -- display-only text under each channel's
+        swatch+name row, never plotted/curved. Network-only (no SPEC-file
+        equivalent for a controller setpoint), gated by the same "Try live
+        network fetch" checkbox as everything else here.
+
+        Energy is the one exception to "refreshed every tick": it's
+        overridden below (after chess_signals.get_live_beam_values()
+        returns) with self._live_energy_value, a cache last updated by a
+        one-shot EnergyEpicsFetchThread -- fired once at app startup and
+        again only when the user clicks "Refresh Energy", never on this
+        1s timer. See EnergyEpicsFetchThread's docstring for why: calling
+        into EPICS Channel Access from a fresh thread every single tick
+        is what caused repeated caRepeater warnings and GUI slowness in
+        an earlier version of this app; chess_signals.get_live_beam_values()'s
+        own HTTP path is tried for "energy" too (harmless), but
+        ID4B_MON_KEV has never been confirmed to answer over HTTP, so in
+        practice the EPICS cache is what actually populates this."""
         use_network = bool(
             getattr(self, "beam_network_checkbox", None)
             and self.beam_network_checkbox.isChecked()
         )
         values = csig.get_live_beam_values(self.df, self.columns, use_network=use_network)
+        # Energy override: chess_signals.get_live_beam_values() only knows
+        # about SPEC-file columns and the HTTP path above -- the live
+        # EPICS reading (this app's only real source for Energy) lives in
+        # self._live_energy_value, a cache filled by the one-shot
+        # EnergyEpicsFetchThread (see _refresh_energy_now()/_on_energy_ready()
+        # and this method's docstring). Only overrides when there's
+        # actually a cached EPICS value; otherwise Energy keeps whatever
+        # the SPEC-file/HTTP loop above already found (or "—").
+        if self._live_energy_value is not None:
+            values["energy"] = {
+                "value": self._live_energy_value,
+                "source": "network",
+                "column": "ID4B_MON_KEV (EPICS)",
+            }
         for canonical, lbl in getattr(self, "beam_signal_labels", {}).items():
             info = values.get(canonical) or {}
             value = info.get("value")
@@ -3889,11 +5530,24 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
                 # by mistake -- instead of just being trusted blindly.
                 if source == "spec":
                     lbl.setToolTip(f"Source: loaded SPEC file, column \"{column}\"")
+                elif canonical == "energy":
+                    # Energy's live value always comes from the
+                    # EnergyEpicsFetchThread cache (self._live_energy_value),
+                    # never from chess_signals' own HTTP path -- see this
+                    # method's docstring and _refresh_energy_now().
+                    lbl.setToolTip(
+                        "Source: live EPICS Channel Access, PV ID4B_MON_KEV "
+                        "-- click \"Refresh Energy\" for an updated reading."
+                    )
                 else:
-                    lbl.setToolTip(f"Source: signals.chess.cornell.edu (live network), PV {column}")
+                    # CESR/IC1/IC2/Diode: HTTP only
+                    # (signals.chess.cornell.edu) -- see chess_signals.py's
+                    # module docstring for why EPICS was fully backed out
+                    # of this path.
+                    lbl.setToolTip(f"Source: live network (signals.chess.cornell.edu), PV {column}")
 
         cesr_value = (values.get("cesr") or {}).get("value")
-        no_beam = csig.is_no_beam(cesr_value)
+        no_beam = csig.is_no_beam(cesr_value, self._last_no_beam_state)
         banner = getattr(self, "no_beam_banner", None)
         if banner is not None:
             banner.setVisible(no_beam)
@@ -3917,6 +5571,142 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
                 else:
                     lbl.setToolTip(f"Source: signals.chess.cornell.edu (live network), PV {column}")
 
+        # Lakeshore setpoint readouts (Temperature tab only, display-only --
+        # never plotted, per the user's explicit request). Network-only, so
+        # these stay "—" unless "Try live network fetch" is checked; see
+        # chess_signals.get_live_setpoint_values()/SETPOINT_PV_MAP for the
+        # LAKESHORE2:SETP_S1/S2/S3 PV wiring.
+        setpoint_values = csig.get_live_setpoint_values(use_network=use_network)
+        for canonical, lbl in getattr(self, "temperature_tab_setpoint_labels", {}).items():
+            value = setpoint_values.get(canonical)
+            label_name = csig.TEMPERATURE_LABELS.get(canonical, canonical)
+            pv = csig.SETPOINT_PV_MAP.get(canonical, {}).get("pv")
+            if value is None:
+                lbl.setText("Setpoint: —")
+                lbl.setToolTip(
+                    "No live setpoint (network fetch off)" if not use_network
+                    else f"No live setpoint (network fetch found nothing for PV {pv})"
+                )
+            else:
+                lbl.setText(f"Setpoint: {value:,.2f} K")
+                lbl.setToolTip(f"{label_name} setpoint -- source: signals.chess.cornell.edu (live network), PV {pv}")
+
+        # Flux (Overall Summary tab's "Flux (IC1)" card, and the Ion
+        # Chamber Flux tab's "Follow live values" fields) is deliberately
+        # NOT touched here anymore -- it's a SNAPSHOT taken once per
+        # successful "Refresh Energy" click instead (see
+        # _snapshot_flux_from_energy(), called from _on_energy_ready()).
+        # Before this change, Flux was recomputed every single 1s tick
+        # from a continuously-live IC1 reading even though Energy itself
+        # was already refresh-only, which meant Flux kept changing on its
+        # own -- exactly what the user explicitly asked to stop ("I don't
+        # need updated flux all the time... if I refresh then energy, then
+        # only it will show the flux, not all the time updated"). Both
+        # Flux and the Ion tab's fields now just keep showing whatever the
+        # last snapshot set, with no per-tick work at all.
+
+        self._record_temp_history(temp_values)
+
+    def _record_temp_history(self, temp_values: Dict[str, Dict]):
+        """Append this tick's temperature readings to self._temp_history
+        (elapsed minutes since the first-ever tick -> value, per canonical
+        channel) and push the updated arrays into BOTH temperature plots --
+        the Overall Summary tab's small "Temperature Vs Time" strip and the
+        dedicated, full-size Temperature tab (see _build_temperature_tab())
+        -- since they share the same underlying data. Skips a channel
+        entirely for this tick if its live value is None (no matching SPEC
+        column, network fetch off/failed) rather than recording a gap or a
+        0 -- so a temporarily-unavailable reading doesn't show up as a
+        plunge to zero on either chart, it just leaves that channel's line
+        flat/paused until a real reading comes back."""
+        now = time.time()
+        if self._temp_history_start_time is None:
+            self._temp_history_start_time = now
+        elapsed_minutes = (now - self._temp_history_start_time) / 60.0
+
+        # Both tabs' custom legend-label dicts get the same live-value text
+        # every tick -- self.temp_history_legend_labels is the Overall
+        # Summary strip's, self.temperature_tab_legend_labels is the
+        # dedicated Temperature tab's (see _build_temperature_tab()).
+        legend_label_dicts = [
+            d for d in (
+                getattr(self, "temp_history_legend_labels", None),
+                getattr(self, "temperature_tab_legend_labels", None),
+            ) if d is not None
+        ]
+        for canonical in csig.TEMPERATURE_ORDER:
+            info = temp_values.get(canonical) or {}
+            value = info.get("value")
+            label_name = csig.TEMPERATURE_LABELS[canonical]
+            if value is None:
+                # Leave the legends showing the last known value rather
+                # than blanking them out for one missed tick.
+                continue
+            times, vals = self._temp_history[canonical]
+            times.append(elapsed_minutes)
+            vals.append(value)
+            for legend_labels in legend_label_dicts:
+                lbl = legend_labels.get(canonical)
+                if lbl is not None:
+                    lbl.setText(f"{label_name}: {value:,.1f} K")
+
+        self._update_temp_history_plot()
+
+    def _update_temp_history_plot(self):
+        """Push self._temp_history's current arrays into the persistent
+        per-channel PlotDataItems of BOTH temperature plots: the Overall
+        Summary strip (self.temp_history_panel / self.temp_history_curves,
+        created in _build_summary_tab()) and the dedicated Temperature tab
+        (self.temperature_tab_panel / self.temperature_tab_curves, created
+        in _build_temperature_tab()).
+
+        The Summary strip gets its fixed 0-500K Y range re-asserted every
+        call -- belt-and-suspenders against anything (a theme switch, a
+        stray autoRange()) silently resetting it, since this runs once a
+        second for the life of the app. The Temperature tab does NOT get a
+        forced Y range here -- it's meant to be freely, properly zoomable
+        (see _build_temperature_tab()'s docstring), so pinning its range on
+        every tick would fight any zoom/pan the user just did there.
+
+        Both panels also "follow live" data by re-asserting their own
+        range each tick -- but ONLY while their respective
+        _temp_history_panel_follow_live / _temperature_tab_follow_live flag
+        is still True. Those flags start True and only turn False once the
+        user actually pans/zooms that panel themselves (see the
+        sigRangeChangedManually wiring in _build_summary_tab() /
+        _build_temperature_tab()), and turn True again when that panel's
+        own Reset button is clicked. Without this, pyqtgraph's own
+        auto-ranging silently disables itself the moment the user touches
+        either plot, which is what made the X axis look "stuck" and forced
+        a manual Reset click to see current data -- reported by the user as
+        "x time is fixed... it is not going left as the time increase" and
+        "I have to reset at the big plot"."""
+        summary_panel = getattr(self, "temp_history_panel", None)
+        summary_curves = getattr(self, "temp_history_curves", None)
+        if summary_panel is not None and summary_curves is not None:
+            for canonical, curve in summary_curves.items():
+                times, vals = self._temp_history.get(canonical, ([], []))
+                curve.setData(times, vals)
+            summary_panel.plot_widget.setYRange(0, 500, padding=0)
+            if getattr(self, "_temp_history_panel_follow_live", True):
+                all_times = [t for canonical in csig.TEMPERATURE_ORDER
+                             for t in self._temp_history.get(canonical, ([], []))[0]]
+                if all_times:
+                    t_min, t_max = min(all_times), max(all_times)
+                    if t_max > t_min:
+                        summary_panel.plot_widget.setXRange(t_min, t_max, padding=0.02)
+                    else:
+                        summary_panel.plot_widget.setXRange(t_min - 0.5, t_max + 0.5, padding=0)
+
+        tab_panel = getattr(self, "temperature_tab_panel", None)
+        tab_curves = getattr(self, "temperature_tab_curves", None)
+        if tab_curves is not None:
+            for canonical, curve in tab_curves.items():
+                times, vals = self._temp_history.get(canonical, ([], []))
+                curve.setData(times, vals)
+            if tab_panel is not None and getattr(self, "_temperature_tab_follow_live", True):
+                tab_panel.plot_widget.getViewBox().autoRange()
+
     def _render_summary_plot(self):
         """Draw the newest scan into the Summary tab's own PlotPanel, using
         the same X/Y column choices as the last plot made on the Plot tab
@@ -3928,10 +5718,12 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         panel = self.summary_plot_panel
         if self.df is None:
             panel.show_empty("Load a SPEC file first.")
+            self.summary_actual_results_label.setText("")
             return
         scan_numbers = self._scan_numbers_for(self.df)
         if not scan_numbers:
             panel.show_empty("No scans found.")
+            self.summary_actual_results_label.setText("")
             return
         last_scan_str = scan_numbers[-1]
 
@@ -3949,13 +5741,56 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             )
         if not x_col or not y_cols:
             panel.show_empty("No columns available yet.")
+            self.summary_actual_results_label.setText("")
             return
 
-        self._render_plot(panel, self.df, x_col, y_cols, [int(last_scan_str)], "line", False)
+        self._render_plot(panel, self.df, x_col, y_cols, [int(last_scan_str)], "line+scatter", False)
+        self._compute_summary_actual_peak(x_col, y_cols[0], last_scan_str)
+        # This redraw itself is always instant (it's just re-drawing
+        # already-loaded data every 0.1s tick); the reload-took-Ys part
+        # below reports on the last background SpecFileLoader run instead,
+        # which is the actual bottleneck when a refresh feels slow -- see
+        # SpecFileLoader's docstring / _on_background_file_loaded().
+        reload_note = (
+            f" (last reload took {self._last_reload_seconds:.1f}s)"
+            if self._last_reload_seconds is not None else ""
+        )
         self.summary_status_label.setText(
             f"Always-live view — scan {last_scan_str}, updated "
-            f"{time.strftime('%H:%M:%S')}."
+            f"{time.strftime('%H:%M:%S')}{reload_note}."
         )
+
+    def _compute_summary_actual_peak(self, x_col: str, y_col: str, scan_str: str) -> None:
+        """Summary tab's own version of _compute_actual_peak(): the actual
+        (raw, measured) Peak/FWHM readout, computed straight from the data
+        via spec_core.find_actual_peak -- no curve fit involved, same as
+        the SPEC Plot tab's "Actual Data" sidebar panel. Always uses the
+        newest scan and the first Y column _render_summary_plot() is
+        already plotting, so this stays in sync with the mini plot with no
+        separate scan/column picker needed on this always-live tab."""
+        try:
+            scan = int(scan_str)
+        except ValueError:
+            self.summary_actual_results_label.setText("")
+            return
+        try:
+            result = sc.find_actual_peak(self.df, x_col, y_col, scan)
+        except Exception as exc:
+            self.summary_actual_results_label.setText(f"Actual-data peak unavailable: {exc}")
+            return
+        if not result.get("success"):
+            self.summary_actual_results_label.setText(
+                f"Actual-data peak unavailable: {result.get('error', 'unknown error')}"
+            )
+            return
+        pseudo_stats = {
+            "peak_position": result["peak_x"],
+            "fwhm": result.get("fwhm"),
+            "amplitude": result["peak_y"],
+            "offset": 0.0,
+        }
+        text = self._format_peak_fwhm_text(pseudo_stats, x_col, y_col)
+        self.summary_actual_results_label.setText(text)
 
     # ------------------------------------------------------------------
     # Compare tab
@@ -4961,15 +6796,22 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self.status_label.setText(f"Exported to {path}")
 
     def closeEvent(self, event):
-        """Stop the Live Image tab's background polling thread, and the
-        Summary tab's own refresh timers, before the app exits, so closing
-        the window doesn't leave a QThread (or a running QTimer) behind."""
+        """Stop the Live Image tab's background polling thread, the
+        SpecFileLoader background reparse thread (if one happens to be in
+        flight), the one-shot EnergyEpicsFetchThread (if a "Refresh
+        Energy" fetch happens to be in flight), and the Summary tab's own
+        refresh timers, before the app exits, so closing the window
+        doesn't leave a QThread (or a running QTimer) behind."""
         if hasattr(self, "live_image_tab"):
             self.live_image_tab.stop()
         if hasattr(self, "_summary_timer"):
             self._summary_timer.stop()
         if hasattr(self, "_beam_signals_timer"):
             self._beam_signals_timer.stop()
+        if getattr(self, "_file_loader_thread", None) is not None and self._file_loader_thread.isRunning():
+            self._file_loader_thread.wait(2000)
+        if getattr(self, "_energy_fetch_thread", None) is not None and self._energy_fetch_thread.isRunning():
+            self._energy_fetch_thread.wait(2000)
         super().closeEvent(event)
 
 

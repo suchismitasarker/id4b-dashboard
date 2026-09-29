@@ -6,3 +6,6 @@ scipy
 reportlab
 Pillow
 requests   # needed for the Summary tab's "Try live network fetch" checkbox AND for Slack Alerts' status-message fetch (new-status.chess.cornell.edu/ID4B)
+pyyaml     # needed for beamline_config.py to load configs/qm2.yaml (Ion Chamber Flux tab + Summary tab's Flux defaults)
+
+pyepics    # optional but needed on lnx201/any on-site CHESS machine for the Summary tab's "Refresh Energy" button (spec_dashboard_qt.EnergyEpicsFetchThread): reads PV ID4B_MON_KEV once over EPICS Channel Access, on demand (once at startup, then only when clicked) -- NOT continuously, per an earlier on-site regression where reading it every 1s tick caused repeated caRepeater warnings and GUI slowness. CESR/IC1/IC2/Diode no longer use EPICS at all (HTTP-only, signals.chess.cornell.edu, via chess_signals.py) -- if pyepics is missing, "Refresh Energy" just reports no reading (Energy shows "—") rather than erroring.

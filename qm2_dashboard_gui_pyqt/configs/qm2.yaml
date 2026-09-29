@@ -1,0 +1,144 @@
+# qm2.yaml -- beamline config for QM2 (CHESS ID4B).
+#
+# Loaded by beamline_config.load_config() (see beamline_config.py). Per the
+# user's explicit choice, this is the ONLY beamline config the dashboard
+# ships with right now (no id3a.yaml / multi-beamline switching) --
+# DEFAULT_CONFIG_PATH in beamline_config.py points straight at this file.
+#
+# Scope note: the dashboard does NOT do a full config-driven refactor of
+# its tabs/signals/summary/plot/timeline/data_layout/live_image/slack
+# behavior -- those all still work exactly as before, hardcoded in
+# spec_dashboard_qt.py and chess_signals.py. The one section this file's
+# values are ACTUALLY read and used for at runtime is `signals.flux.chambers`
+# below, which supplies the per-chamber gas/method/length/gain the new Ion
+# Chamber Flux tab and the Summary tab's X-ray Flux row use to turn live
+# IC1/IC2 counts into a computed flux (see ion_chamber_flux.py). Everything
+# else here exists so the file satisfies beamline_config.REQUIRED_SECTIONS
+# and documents the beamline's layout for a future fuller integration, but
+# isn't consumed yet.
+
+beamline:
+  name: QM2
+  facility: CHESS
+  station: ID4B
+
+app:
+  title: QM2 Dashboard
+
+# Known tab keys only (beamline_config.TAB_LABELS doesn't have a
+# "temperature" entry -- the dashboard's Temperature tab predates this
+# config file and isn't config-driven, so it's deliberately left out here
+# rather than listed and rejected by load_config()'s validation).
+tabs:
+  - key: home
+    show: true
+  - key: summary
+    label: Overall Summary
+    show: true
+  - key: plot
+    label: SPEC Plot
+    show: true
+  - key: live_image
+    label: Live Image
+    show: true
+  - key: timeline
+    label: Folder Timeline
+    show: true
+  - key: scan_info
+    label: Scan Info
+    show: true
+  - key: motor_positions
+    label: Motor Positions
+    show: true
+  - key: export
+    label: Export
+    show: true
+  - key: ion_flux
+    label: Ion Chamber Flux
+    description: Ion-chamber flux calculator (ion_chamber_flux.py), auto-filled from live Energy/IC1/IC2 readings.
+    show: true
+  - key: slack_alerts
+    label: Slack Alerts
+    show: true
+
+signals:
+  # Canonical channel name -> PV (matches chess_signals.BEAM_PV_MAP /
+  # TEMPERATURE_PV_MAP / SETPOINT_PV_MAP, repeated here for documentation;
+  # not re-read from here at runtime -- see the scope note above).
+  channels:
+    cesr:
+      pv: ID4B_CNT01_VLT
+    ic1:
+      pv: ID4B_CNT00_VLT
+    ic2:
+      pv: ID4B_CNT02_VLT
+    diode:
+      pv: ID4B_CNT03_VLT
+    flow:
+      pv: null
+    energy:
+      pv: null
+    stage1_temp:
+      pv: ID4B_CRYOGL_STG1_T
+    sample_temp:
+      pv: ID4B_CRYOGL_SAM_T
+    stage2_temp:
+      pv: ID4B_CRYOGL_STG2_T
+
+  no_beam:
+    channel: cesr
+    no_beam_threshold_ma: 0.05
+    beam_restored_threshold_ma: 1.4
+
+  # Genuinely consumed: SpecDashboardApp reads this at startup to seed the
+  # Ion Chamber Flux tab's per-chamber defaults and the Summary tab's live
+  # Flux computation. gas/method must match ion_chamber_flux.GASES /
+  # .METHODS; length_cm is each chamber's physical length (CHESS's two
+  # standard lengths are 6 cm "short" and 27 cm "long" --
+  # ion_chamber_flux.STANDARD_LENGTHS_CM); gain is the current amplifier's
+  # range in A/V (e.g. 1e-6 A/V). None of these four numbers have been
+  # independently confirmed against QM2's actual installed chambers/gas/
+  # amplifier settings -- they're reasonable placeholders (Nitrogen is
+  # CHESS's typical ion-chamber gas, "Total less elastic" the calculator's
+  # default method) so the tab has sensible defaults out of the box, but
+  # should be checked/edited on-site before trusting the numbers.
+  flux:
+    chambers:
+      ic1:
+        gas: Nitrogen
+        method: 0
+        length_cm: 6.0
+        gain_a_per_v: 1.0e-6
+      ic2:
+        gas: Nitrogen
+        method: 0
+        length_cm: 27.0
+        gain_a_per_v: 1.0e-6
+
+summary:
+  groups:
+    - title: Beam Condition
+      channels: [cesr, ic1, ic2, diode]
+    - title: Temperature Information
+      channels: [flow]
+    - title: X-ray Flux
+      channels: [energy]
+
+plot:
+  default_x: Pt No.
+  default_y: counts
+
+timeline:
+  folder_pattern: "*.spec"
+
+data_layout:
+  root: /data/id4b
+
+spec_parsing:
+  comment_prefixes: ["#"]
+
+live_image:
+  enabled: false
+
+slack:
+  enabled: false
