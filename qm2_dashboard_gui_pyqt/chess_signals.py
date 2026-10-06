@@ -328,6 +328,15 @@ CHANNEL_NAME_PATTERNS: Dict[str, List[str]] = {
     "diode": ["diode", "pin_diode", "pindiode", "beam_stop_diode", "beamstopdiode"],
     "flow": ["flow", "gas_flow", "flow_rate", "cryo_flow"],
     "energy": ["energy", "mono_energy", "monoenergy", "beam_energy", "beamenergy"],
+    # "mostab" -- the user's explicit display label for a new Beam
+    # Condition card reading ID4B_CNT06_VLT (counter #6 in the same
+    # ID4B_CNTnn_VLT family as ic1=CNT00/cesr=CNT01/ic2=CNT02/diode=CNT03).
+    # "mostab" was NOT a typo -- the user confirmed via AskUserQuestion
+    # that "Mostab" is the literal label they want, so the SPEC-column
+    # match patterns below cover the label itself plus the raw PV name in
+    # case a loaded SPEC file happens to log this column under either
+    # spelling. See BEAM_PV_MAP below for the network PV/scaling notes.
+    "mostab": ["mostab", "cnt06", "id4b_cnt06_vlt"],
 }
 
 # Display order + labels for the Summary tab readouts. "flow" -> "Flow
@@ -342,6 +351,7 @@ CHANNEL_LABELS: Dict[str, str] = {
     "diode": "Diode",
     "flow": "Flow Rate",
     "energy": "Energy",
+    "mostab": "Mostab",
 }
 # "energy" now lives in CHANNEL_ORDER (per the user's explicit request to
 # show it "under the same banner as Beam Condition" alongside CESR/IC1/
@@ -352,7 +362,12 @@ CHANNEL_LABELS: Dict[str, str] = {
 # other change needed on the display side. The computed Flux readout
 # (not a raw channel -- see ion_chamber_flux.py) stays in its own small
 # section below Beam Condition, since it isn't a live_beam_values() entry.
-CHANNEL_ORDER: List[str] = ["cesr", "ic1", "ic2", "diode", "flow", "energy"]
+# "mostab" appended at the end (after "energy") -- a brand-new card, added
+# per the user's explicit request to add ID4B_CNT06_VLT as a "Mostab"
+# reading in the Beam Condition row; appending (rather than inserting
+# next to ic1/ic2/diode/cesr) keeps every existing card's position
+# unchanged.
+CHANNEL_ORDER: List[str] = ["cesr", "ic1", "ic2", "diode", "flow", "energy", "mostab"]
 
 # Compiled once: each pattern is only allowed to match a column name where
 # it isn't immediately preceded/followed by another digit. Without this, a
@@ -484,6 +499,24 @@ BEAM_PV_MAP: Dict[str, Dict] = {
     # edu here) -- worth sanity-checking the dashboard's live Energy number
     # against the actual monochromator readout once run on-site.
     "energy": {"pv": "ID4B_MON_KEV", "multiplier": 1, "range": (0, 200)},
+    # "mostab" -- ID4B_CNT06_VLT, counter #6 in the same ID4B_CNTnn_VLT
+    # family as ic1 (CNT00), cesr (CNT01), ic2 (CNT02), diode (CNT03). The
+    # user gave this PV directly (via a signals.chess.cornell.edu/plot?
+    # ...&pv=ID4B_CNT06_VLT&... URL) along with that URL's own
+    # yunits=volts&ymin=0&ymax=10&ytype=linear query params, confirming the
+    # RAW signal is linear volts in a 0-10V band -- but, unlike ic1/ic2/
+    # diode's confirmed x10000 (from a script's own ALL_PV_MAPPING dict),
+    # no engineering-unit conversion factor for "mostab" has been given, so
+    # the multiplier here is left at 1 (displayed as raw volts) rather than
+    # guessed at x10000 -- the same "don't assume ic1/ic2/diode's scale
+    # factor transfers" judgment call already made for cesr above. The
+    # range (0, 10) matches the URL's own ymin/ymax exactly (tighter than
+    # the generic -10/100 placeholder used for ic1/ic2/diode, since this
+    # one's band is actually confirmed by the user's URL). Sanity-check
+    # the dashboard's live Mostab number on-site and update the multiplier
+    # here if a real engineering-unit scale factor turns up, the same way
+    # CESR's/other channels' entries would be revised.
+    "mostab": {"pv": "ID4B_CNT06_VLT", "multiplier": 1, "range": (0, 10)},
 }
 
 # The cryostat temperature PVs from the user's original temperature-only

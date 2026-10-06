@@ -16,11 +16,14 @@ Requirements:
     pip install PyQt5 pyqtgraph pandas numpy scipy
 """
 
+import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import smtplib
+import subprocess
 import sys
 import time
 import urllib.error
@@ -44,6 +47,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
+    HRFlowable,
     Image as RLImage,
     Paragraph,
     SimpleDocTemplate,
@@ -394,6 +398,29 @@ QLabel[panelTitle="true"] {{
     font-weight: 600;
     color: {ACCENT};
 }}
+QFrame[homeHero="true"] {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-top: 3px solid {ACCENT};
+    border-radius: 10px;
+}}
+QFrame[homeCard="true"] {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-left: 3px solid {ACCENT};
+    border-radius: 8px;
+}}
+QFrame[homeCard="true"]:hover {{
+    border-color: {ACCENT};
+}}
+QLabel[homeChip="true"] {{
+    background-color: {BG_INPUT};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    padding: 3px 10px;
+    color: {TEXT_SECONDARY};
+    font-size: 11px;
+}}
 """
 
 
@@ -419,6 +446,40 @@ pg.setConfigOptions(antialias=True, background=BG_PANEL, foreground=TEXT_PRIMARY
 # fully spelled out.
 APP_TITLE = "QM2 Dashboard"
 HOME_PAGE_TITLE = "Quantum Materials (QM2) Beamline Dashboard"
+
+# HOME_LOGO_DIR: the logo/ folder the Home tab looks in for chess_logo.png
+# and chexs_logo.jpg (see _load_home_logo_pixmap()), resolved relative to
+# THIS SCRIPT'S OWN LOCATION on disk -- os.path.dirname(os.path.abspath(
+# __file__)) -- rather than a hardcoded absolute path, so it keeps working
+# no matter which on-site directory spec_dashboard_qt.py is deployed to or
+# which user account runs it. This matches the on-site layout the user
+# described (a logo/ subfolder sitting next to spec_dashboard_qt.py
+# itself, e.g. .../SPEC_dashboard/spec_dashboard_GUI/logo/). These two
+# image files aren't part of this codebase and don't exist in the sandbox
+# this was developed in -- they need to be placed on-site, in a logo/
+# folder next to this .py file, for the Home tab to pick them up. Until
+# then (or if either filename is simply missing), the Home tab quietly
+# omits that logo rather than showing a broken-image icon or raising.
+HOME_LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo")
+
+
+def _find_summary_pdf_logo_paths(max_count: int = 2) -> list:
+    """Return the on-disk paths (within HOME_LOGO_DIR) of whichever CHESS
+    logo image(s) exist, for the Experiment Summary PDF's footer -- the
+    same two candidate filenames as the Home tab's footer (see
+    HOME_LOGO_DIR / _load_home_logo_pixmap() above), just returning plain
+    file paths here since reportlab's Image flowable draws from a path
+    rather than a QPixmap. Never raises: these logo files only exist
+    on-site, not in every dev/sandbox checkout, so a PDF built without
+    them simply omits the footer logo row instead of failing."""
+    paths = []
+    for filename in ("chess_logo.png", "chexs_logo.jpg"):
+        path = os.path.join(HOME_LOGO_DIR, filename)
+        if os.path.isfile(path):
+            paths.append(path)
+        if len(paths) >= max_count:
+            break
+    return paths
 
 
 def _color_for(i: int) -> str:
@@ -793,6 +854,20 @@ def _is_calibration(spec_file: str) -> bool:
     return any(c in lc for c in _CALIBRATION_FILES)
 
 
+# Terms that disqualify a SPEC file from the sample count quoted in the
+# narrative intro paragraph at the top of the Experiment Summary PDF only
+# (see _render_summary_pdf) -- alignment scans and the CeO2 calibration
+# standard aren't samples. Deliberately narrower/separate from
+# _CALIBRATION_FILES above, which drives the broader calibration-file
+# split used by the stat cards, detail table, and charts elsewhere.
+_SUMMARY_SAMPLE_EXCLUDE_TERMS = ("align", "ceo2")
+
+
+def _counts_toward_summary_sample(spec_file: str) -> bool:
+    lc = (spec_file or "").lower()
+    return not any(t in lc for t in _SUMMARY_SAMPLE_EXCLUDE_TERMS)
+
+
 def _safe_float(value) -> float:
     try:
         return float(value)
@@ -811,6 +886,22 @@ def _short_label(spec_file: str, max_len: int = 14) -> str:
     if len(name) > max_len:
         name = name[: max_len - 1] + "…"
     return name
+
+
+def _label_max_len_for_count(n: int) -> int:
+    """Pick a max tick-label length for the bar/temperature summary charts'
+    bottom axis based on how many SPEC files are plotted side by side. The
+    axis lays out one non-rotated horizontal label per integer x-position,
+    so a fixed truncation length that looks fine for 2-3 files starts to
+    visually overlap once there are many -- shorten more aggressively as
+    the file count grows so neighboring labels keep clear of each other."""
+    if n <= 4:
+        return 14
+    if n <= 7:
+        return 10
+    if n <= 12:
+        return 7
+    return 5
 
 
 def _style_summary_chart(panel: "PlotPanel", title: str, y_label: str = ""):
@@ -993,6 +1084,91 @@ def _live_frame_number_from_path(path):
     """Extract the trailing zero-padded frame number from a Pilatus filename."""
     m = _LIVE_FRAME_NO_RE.search(os.path.basename(path))
     return int(m.group(1)) if m else None
+
+
+def derive_pyfai_calibration_output_folder(input_folder: str) -> str:
+    """Best-effort derivation of the CHESS "calibrations" output folder
+    from a raw-image input folder, for the pyFAI Average tab -- following
+    the exact convention the user gave:
+
+        /nfs/chess/id4b/2026-3/clancy-5115-a/raw6M/CeO2_new/standard/300/CeO2_new_001
+        -> /nfs/chess/id4baux/2026-3/clancy-5115-a/calibrations
+
+    i.e. swap the "id4b" path segment for "id4baux", then replace
+    everything from "raw6M" onward with a single "calibrations" segment.
+
+    Deliberately a pure, Qt-free function (no GUI/QFileDialog calls) so
+    it can be exercised with a plain standalone test in this sandbox
+    (which has no usable PyQt5) -- see the verification script run
+    alongside this change.
+
+    Never raises: an input folder that doesn't follow the id4b/raw6M
+    convention (a different beamline's tree, a scratch/test directory,
+    etc.) falls back to a "calibrations" sibling folder next to the
+    input folder instead of guessing something nonsensical. Either way
+    the result is only ever shown to the user in an EDITABLE field on
+    the tab, never used blindly -- a wrong guess is a one-click fix, not
+    a silent misfile."""
+    if not input_folder:
+        return ""
+    folder = os.path.normpath(input_folder)
+    parts = folder.split(os.sep)
+    try:
+        id4b_idx = parts.index("id4b")
+    except ValueError:
+        id4b_idx = None
+    if id4b_idx is not None:
+        parts = list(parts)
+        parts[id4b_idx] = "id4baux"
+        try:
+            raw_idx = parts.index("raw6M", id4b_idx)
+        except ValueError:
+            raw_idx = None
+        if raw_idx is not None:
+            parts = parts[:raw_idx] + ["calibrations"]
+        else:
+            parts = parts + ["calibrations"]
+        return os.sep.join(parts)
+    # Fallback: no "id4b" path segment found at all (not a standard
+    # id4b/raw6M-convention path) -- put output in a "calibrations"
+    # sibling next to the input folder rather than mixing it in with
+    # raw data, or (if the input folder has no parent, e.g. "/") right
+    # inside it.
+    parent = os.path.dirname(folder)
+    return os.path.join(parent or folder, "calibrations")
+
+
+def _derive_processed_and_calib_folders(raw_folder: str):
+    """Best-effort derivation of an experiment's processed-data and
+    calibration-data folders from its raw-data folder, for the
+    Experiment Summary PDF's "data locations" lines -- the same id4b ->
+    id4baux convention as derive_pyfai_calibration_output_folder() above
+    (truncating at a "raw6M" segment too, if the raw folder happens to be
+    pointed that deep rather than at the id4b root). Returns ("", "") if
+    the raw folder doesn't follow this convention (no "id4b" path
+    segment) rather than guessing a nonsensical fallback -- unlike the
+    pyFAI tab's version, this one only ever feeds static PDF text, with
+    no "it's just an editable starting guess" safety net, so an
+    unrecognized layout should omit the lines rather than show a wrong
+    path as fact."""
+    if not raw_folder:
+        return "", ""
+    folder = os.path.normpath(raw_folder)
+    parts = folder.split(os.sep)
+    try:
+        id4b_idx = parts.index("id4b")
+    except ValueError:
+        return "", ""
+    parts = list(parts)
+    parts[id4b_idx] = "id4baux"
+    try:
+        raw_idx = parts.index("raw6M", id4b_idx)
+    except ValueError:
+        raw_idx = None
+    processed_parts = parts[:raw_idx] if raw_idx is not None else parts
+    processed_folder = os.sep.join(processed_parts)
+    calib_folder = os.path.join(processed_folder, "calibrations")
+    return processed_folder, calib_folder
 
 
 class LiveImageLoader(QtCore.QThread):
@@ -1389,6 +1565,105 @@ class EnergyEpicsFetchThread(QtCore.QThread):
         self.energy_ready.emit(csig.leading_number(raw))
 
 
+class PyFaiAverageThread(QtCore.QThread):
+    """Background worker for the "pyFAI Average" tab: runs the external
+    `pyFAI-average` CLI (from the `pyFAI` package) on a chosen set of
+    input .cbf frames and writes one averaged output file -- the exact
+    kind of command the user asked to wrap:
+
+        pyFAI-average -o CeO2_45keV_new.cbf CeO2_new_PIL10_001_*.cbf
+
+    Runs on its own QThread so averaging many large 6-megapixel Pilatus
+    frames can never freeze the GUI -- the Run button just stays
+    disabled (see _run_pyfai_average()/_on_pyfai_finished_ok()/
+    _on_pyfai_finished_error() in SpecDashboardApp) until one of this
+    thread's two signals fires.
+
+    Per the user's explicit "make sure the whole code should not break
+    during averaging": run() wraps EVERY step (missing `pyFAI-average`
+    executable, empty file list, output-folder creation, launching the
+    subprocess, a non-zero exit code, a missing output file after a
+    reported success, and a final catch-all) in its own guard and always
+    emits exactly one of finished_ok/finished_error -- never raises back
+    into the Qt event loop, never crashes the app, never leaves the UI
+    hanging with no response."""
+
+    finished_ok = QtCore.pyqtSignal(str, str)      # output_path, log text
+    finished_error = QtCore.pyqtSignal(str)        # error message
+
+    def __init__(self, input_files, output_path, extra_args=None, timeout=1800.0):
+        super().__init__()
+        self.input_files = list(input_files)
+        self.output_path = output_path
+        self.extra_args = list(extra_args) if extra_args else []
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            exe = shutil.which("pyFAI-average")
+            if not exe:
+                self.finished_error.emit(
+                    "pyFAI-average was not found on PATH. Install the "
+                    "pyFAI package first (see the install-status panel "
+                    "at the top of this tab for the exact command), then "
+                    "try again."
+                )
+                return
+            if not self.input_files:
+                self.finished_error.emit(
+                    "No input files were selected -- check at least one "
+                    "frame in the list before running."
+                )
+                return
+            if not self.output_path:
+                self.finished_error.emit(
+                    "No output file name/path was set."
+                )
+                return
+            out_dir = os.path.dirname(self.output_path)
+            if out_dir:
+                try:
+                    os.makedirs(out_dir, exist_ok=True)
+                except OSError as exc:
+                    self.finished_error.emit(
+                        f"Could not create the output folder {out_dir!r}: {exc}"
+                    )
+                    return
+            cmd = [exe, "-o", self.output_path] + self.extra_args + self.input_files
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                self.finished_error.emit(
+                    f"pyFAI-average timed out after {self.timeout:.0f}s -- "
+                    "the frame set may be very large, or the process may "
+                    "be stuck."
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 -- e.g. OSError launching it
+                self.finished_error.emit(f"Failed to launch pyFAI-average: {exc}")
+                return
+            log = (proc.stdout or "").strip()
+            if proc.stderr:
+                log = (log + "\n" + proc.stderr.strip()).strip()
+            if proc.returncode != 0:
+                self.finished_error.emit(
+                    f"pyFAI-average exited with code {proc.returncode}:\n"
+                    f"{log or '(no output)'}"
+                )
+                return
+            if not os.path.isfile(self.output_path):
+                self.finished_error.emit(
+                    "pyFAI-average reported success (exit code 0) but no "
+                    f"output file was found at {self.output_path!r}.\n{log}"
+                )
+                return
+            self.finished_ok.emit(self.output_path, log)
+        except Exception as exc:  # noqa: BLE001 -- absolute last-resort guard
+            self.finished_error.emit(f"Unexpected error during averaging: {exc}")
+
+
 class LiveImageTab(QtWidgets.QWidget):
     """The "Live Image (Pilatus)" tab: point it at a folder of .cbf frames
     and it continuously shows the newest one, with an optional ROI monitor
@@ -1565,6 +1840,23 @@ class LiveImageTab(QtWidgets.QWidget):
         status_row.addWidget(self.readout)
         v.addLayout(status_row)
         self.imv.getView().scene().sigMouseMoved.connect(self._on_mouse_moved)
+        # Hover tooltip for the ROI integrated-intensity plot -- per the
+        # user's explicit "only add tooltip" answer (no crosshair lines),
+        # this is a native QToolTip that follows the mouse and shows the
+        # nearest frame/intensity value, not an InfiniteLine-based
+        # crosshair like PlotPanel's (PlotPanel's own plots -- the SPEC
+        # Plot tab's main chart, Temperature vs Time, etc. -- already
+        # have a full crosshair+coordinate-readout; self.roi_plot here is
+        # a bare pg.PlotWidget with no such feature at all, so this is
+        # where it was actually missing). Wrapped in a rate-limited
+        # SignalProxy, same pattern PlotPanel._on_mouse_moved uses, so it
+        # doesn't fire on every single mouse-move event; the proxy object
+        # itself must be kept on self (not just connected locally) or
+        # Python would garbage-collect it immediately.
+        self._roi_plot_mouse_proxy = pg.SignalProxy(
+            self.roi_plot.scene().sigMouseMoved, rateLimit=30,
+            slot=self._on_roi_plot_mouse_moved,
+        )
 
     def _set_status(self, text):
         if hasattr(self, "status_bar_label"):
@@ -1744,6 +2036,44 @@ class LiveImageTab(QtWidgets.QWidget):
                 % (det_r, det_c, int(cnt), ("  [%dx binned]" % f) if f > 1 else ""))
         else:
             self.readout.setText("cursor: -")
+
+    def _on_roi_plot_mouse_moved(self, evt):
+        """Hover-only tooltip for the ROI integrated-intensity plot (frame
+        number vs. ROI counts): shows the nearest plotted point's (frame,
+        intensity) in a native QToolTip that follows the mouse, with NO
+        crosshair lines drawn on the chart -- per the user's explicit
+        "only add tooltip" clarification. evt is a SignalProxy wrapper
+        around sigMouseMoved's usual single-QPointF argument (the scene
+        position), same convention PlotPanel._on_mouse_moved uses."""
+        pos = evt[0] if isinstance(evt, (tuple, list)) else evt
+        if not self.roi_plot.sceneBoundingRect().contains(pos):
+            QtWidgets.QToolTip.hideText()
+            return
+        xdata = self.roi_curve.xData
+        ydata = self.roi_curve.yData
+        if xdata is None or len(xdata) == 0:
+            QtWidgets.QToolTip.hideText()
+            return
+        vb = self.roi_plot.getViewBox()
+        view_point = vb.mapSceneToView(pos)
+        vx = view_point.x()
+        idx = int(np.argmin(np.abs(np.asarray(xdata) - vx)))
+        frame_val = xdata[idx]
+        intensity_val = ydata[idx]
+        # QGraphicsView.mapFromScene() (unlike a QGraphicsItem's own
+        # mapFromScene()) already returns an integer QPoint, not a
+        # QPointF -- no .toPoint() needed/available here.
+        global_pos = self.roi_plot.mapToGlobal(
+            self.roi_plot.mapFromScene(pos)
+        )
+        QtWidgets.QToolTip.showText(
+            global_pos,
+            "frame %d\nintensity %s" % (
+                int(frame_val),
+                format(intensity_val, ",.1f"),
+            ),
+            self.roi_plot,
+        )
 
     def on_new_image(self, data, path, mtime, active_dir):
         self._raw = data
@@ -2525,6 +2855,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self._build_summary_tab()
         self._build_temperature_tab()
         self._build_ion_flux_tab()
+        self._build_pyfai_average_tab()
         self._build_slack_alerts_tab()
         self._build_export_tab()
 
@@ -2542,6 +2873,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             "Live Image (Pilatus)",
             "Temperature",
             "Ion Chamber Flux",
+            "pyFAI Average",
             "Folder Timeline",
             "Scan Info",
             "Motor Positions",
@@ -2566,9 +2898,83 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         frames and show the newest one in real time, with an optional ROI
         monitor — folded in from the standalone pilatus_live_viewer.py app
         (see LiveImageTab above) so both live views are available in one
-        window."""
+        window.
+
+        Also builds a mirrored "Beam Condition" row above the image view
+        -- same cards (CESR/IC1/IC2/Diode/Energy/Mostab), same live
+        values, refreshed by the same 1s _beam_signals_tick() -- per the
+        user's explicit request to show beam condition on this tab too,
+        not just the Overall Summary tab. LiveImageTab itself is a
+        self-contained widget (its own _build_ui(), not a
+        _build_X_tab()-style method on this class), so rather than
+        editing it, this wraps the existing LiveImageTab instance in a
+        new container widget: a vertical layout with the beam row on
+        top and the LiveImageTab filling the rest. The tab widget added
+        to self.tabs is now this container, not LiveImageTab directly --
+        self.live_image_tab still refers to the LiveImageTab instance
+        itself (unchanged), so every other reference to
+        self.live_image_tab elsewhere in this file (register_mirror(),
+        etc.) keeps working exactly as before."""
+        container = QtWidgets.QWidget()
+        container_layout = QtWidgets.QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.live_image_beam_header = QtWidgets.QLabel("Beam Condition")
+        self.live_image_beam_header.setProperty("sectionHeader", True)
+        container_layout.addWidget(self.live_image_beam_header)
+        container_layout.addSpacing(2)
+
+        live_image_beam_row = self._build_beam_condition_cards_row()
+        live_image_beam_row.addStretch(1)
+        container_layout.addLayout(live_image_beam_row)
+        container_layout.addSpacing(6)
+
         self.live_image_tab = LiveImageTab()
-        self.tabs.addTab(self.live_image_tab, "Live Image (Pilatus)")
+        container_layout.addWidget(self.live_image_tab)
+
+        self.tabs.addTab(container, "Live Image (Pilatus)")
+
+    def _build_beam_condition_cards_row(self) -> QtWidgets.QHBoxLayout:
+        """Builds one row of Beam Condition readout cards -- CESR, IC1,
+        IC2, Diode, Energy, Mostab (everything in chess_signals.
+        CHANNEL_ORDER except "flow", which lives in the Temperature
+        Information row instead -- unchanged from before). Factored out
+        of _build_summary_tab() so the exact same row of cards can also
+        be built a second time on the Live Image (Pilatus) tab (see
+        _build_live_image_tab()), per the user's explicit request to
+        show Beam Condition there too.
+
+        self.beam_signal_labels is {canonical: [QLabel, ...]} -- a LIST
+        of labels per channel, not a single QLabel -- precisely so a
+        channel can have more than one on-screen copy (one on the
+        Summary tab, one on the Pilatus tab) kept in sync by the same
+        1s _beam_signals_tick(). Each call to this method appends a
+        freshly-built QLabel onto that list rather than overwriting
+        whatever's already there, so calling it once per tab (Summary,
+        then Pilatus) is exactly what wires both tabs' cards up to the
+        same live values with no other change needed in the tick
+        handler itself."""
+        if not hasattr(self, "beam_signal_labels"):
+            self.beam_signal_labels: Dict[str, List[QtWidgets.QLabel]] = {}
+        row = QtWidgets.QHBoxLayout()
+        for canonical in csig.CHANNEL_ORDER:
+            if canonical == "flow":
+                continue
+            box = QtWidgets.QFrame()
+            box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            box.setProperty("cardStyle", True)
+            box_layout = QtWidgets.QVBoxLayout(box)
+            box_layout.setContentsMargins(12, 8, 12, 8)
+            box_layout.setSpacing(2)
+            name_lbl = QtWidgets.QLabel(csig.CHANNEL_LABELS[canonical])
+            name_lbl.setProperty("secondaryText", True)
+            value_lbl = QtWidgets.QLabel("—")
+            value_lbl.setStyleSheet("font-size: 12pt; font-weight: bold;")
+            box_layout.addWidget(name_lbl)
+            box_layout.addWidget(value_lbl)
+            row.addWidget(box)
+            self.beam_signal_labels.setdefault(canonical, []).append(value_lbl)
+        return row
 
     def _build_summary_tab(self):
         """"Summary" tab: a minimal, watch-only view with the latest-scan
@@ -2602,8 +3008,8 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         layout.addWidget(self.beam_condition_header)
         layout.addSpacing(2)
 
-        # 5 live beam-monitor readouts (CESR, IC1, IC2, diode, Energy),
-        # refreshed once a second by _beam_signals_tick() via
+        # 6 live beam-monitor readouts (CESR, IC1, IC2, diode, Energy,
+        # Mostab), refreshed once a second by _beam_signals_tick() via
         # chess_signals.py. Each is its own small boxed "card" with a name
         # and a big value; a checkbox lets the (opt-in, on-site-only)
         # direct network fetch from signals.chess.cornell.edu be turned on
@@ -2612,30 +3018,16 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         # user's explicit request to show it "under the same banner as
         # Beam Condition" rather than in a separate section -- it's simply
         # part of csig.CHANNEL_ORDER now, so it falls out of this same loop
-        # with no other change needed. Flow is also one of
-        # chess_signals.CHANNEL_ORDER (its value still comes from
-        # get_live_beam_values() exactly like these 5), but per the user's
+        # with no other change needed. Mostab (PV ID4B_CNT06_VLT) was
+        # added the same way, per a later request -- see chess_signals.
+        # CHANNEL_ORDER/BEAM_PV_MAP for the scaling caveats. Flow is also
+        # one of chess_signals.CHANNEL_ORDER (its value still comes from
+        # get_live_beam_values() exactly like these 6), but per the user's
         # request it's displayed below with the temperature readouts
-        # rather than in this row -- skipped here.
-        beam_row = QtWidgets.QHBoxLayout()
-        self.beam_signal_labels: Dict[str, QtWidgets.QLabel] = {}
-        for canonical in csig.CHANNEL_ORDER:
-            if canonical == "flow":
-                continue
-            box = QtWidgets.QFrame()
-            box.setFrameShape(QtWidgets.QFrame.StyledPanel)
-            box.setProperty("cardStyle", True)
-            box_layout = QtWidgets.QVBoxLayout(box)
-            box_layout.setContentsMargins(12, 8, 12, 8)
-            box_layout.setSpacing(2)
-            name_lbl = QtWidgets.QLabel(csig.CHANNEL_LABELS[canonical])
-            name_lbl.setProperty("secondaryText", True)
-            value_lbl = QtWidgets.QLabel("—")
-            value_lbl.setStyleSheet("font-size: 12pt; font-weight: bold;")
-            box_layout.addWidget(name_lbl)
-            box_layout.addWidget(value_lbl)
-            beam_row.addWidget(box)
-            self.beam_signal_labels[canonical] = value_lbl
+        # rather than in this row -- skipped here. Card-building itself is
+        # factored into _build_beam_condition_cards_row() so the exact
+        # same row can also be built on the Live Image (Pilatus) tab.
+        beam_row = self._build_beam_condition_cards_row()
         beam_row.addStretch(1)
         self.beam_network_checkbox = QtWidgets.QCheckBox(
             "Try live network fetch (on-site/CHESS network only)"
@@ -2757,7 +3149,14 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             if is_temperature:
                 self.temperature_signal_labels[canonical] = value_lbl
             else:
-                self.beam_signal_labels[canonical] = value_lbl
+                # "flow" is the only non-temperature channel in this loop
+                # (see list(csig.TEMPERATURE_ORDER) + ["flow"] above) --
+                # self.beam_signal_labels is {canonical: [QLabel, ...]},
+                # so append rather than overwrite, same as
+                # _build_beam_condition_cards_row() does for every other
+                # channel (keeps this consistent even though, in
+                # practice, "flow" only ever gets this one card today).
+                self.beam_signal_labels.setdefault(canonical, []).append(value_lbl)
         temp_row.addStretch(1)
         layout.addLayout(temp_row)
         layout.addSpacing(6)
@@ -3473,6 +3872,378 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             if error_lbl is not None:
                 error_lbl.setText(f"Calculation failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # pyFAI Average tab
+    # ------------------------------------------------------------------
+    def _build_pyfai_average_tab(self):
+        """"pyFAI Average" tab -- wraps the external `pyFAI-average` CLI
+        (from the `pyFAI` package) so a set of raw .cbf detector frames
+        can be browsed/selected and averaged into one output file,
+        mirroring the user's exact reference command:
+
+            pyFAI-average -o CeO2_45keV_new.cbf \\
+                /nfs/chess/id4b/2026-3/clancy-5115-a/raw6M/CeO2_new/standard/300/CeO2_new_001/CeO2_new_PIL10_001_*.cbf
+
+        Workflow: "Browse Folder..." navigates (via QFileDialog, same
+        pattern as Folder Timeline/Live Image's own browse buttons) to
+        the leaf folder actually containing the raw frames (e.g.
+        .../raw6M/CeO2_new/standard/300/CeO2_new_001) -- every *.cbf file
+        directly in that folder is then listed as a checkable row
+        (checked by default; "Select All"/"Select None" alongside), per
+        the user's own phrasing ("browse the folder ... image to
+        select[,] do the averaging"). Output Folder is auto-derived from
+        the chosen input folder via derive_pyfai_calibration_output_folder()
+        (the id4b -> id4baux / raw6M.../ -> calibrations swap the user
+        described) into an EDITABLE field -- a wrong guess for a
+        non-standard path is a one-click fix, never a silent misfile --
+        plus its own "Browse..." override. Output File Name is a plain
+        user-typed field (e.g. "CeO2_45keV_new.cbf"), per the user's
+        explicit follow-up ("I should be able to provide the name of the
+        file like CeO2_45keV_new.cbf") -- NOT auto-generated.
+
+        An optional "Extra pyFAI-average arguments (advanced)" free-text
+        field lets power users append verbatim flags pyFAI-average itself
+        supports (e.g. "-m median", "--dark dark.cbf") without this code
+        having to guess/hardcode exact flag names it can't verify in this
+        sandbox (pyFAI isn't installed here -- see the install-status
+        panel below); parsed with shlex.split() in a try/except so a
+        malformed entry shows a clear error instead of crashing anything.
+        Leaving it blank runs the plain `-o <output> <files...>` form,
+        matching the user's literal example exactly.
+
+        Averaging itself always runs on a background PyFaiAverageThread
+        (see that class's docstring) so the GUI is never blocked and
+        never crashes regardless of what pyFAI-average does -- the Run
+        button disables for the duration and a status/log panel reports
+        the exact command, then success or a clear error message."""
+        w = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        header = QtWidgets.QLabel("pyFAI Average")
+        header.setProperty("sectionHeader", True)
+        layout.addWidget(header)
+        subtitle = QtWidgets.QLabel(
+            "Average a set of raw detector frames (.cbf) into one output "
+            "file using the external pyFAI-average command-line tool -- "
+            "e.g. for building a calibration standard."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setProperty("secondaryText", True)
+        layout.addWidget(subtitle)
+
+        # Install-status panel -- checked once at tab-build time (and
+        # again on demand via "Recheck"), so missing pyFAI is surfaced
+        # clearly up front rather than discovered only when Run fails.
+        self.pyfai_install_status_label = QtWidgets.QLabel("")
+        self.pyfai_install_status_label.setWordWrap(True)
+        layout.addWidget(self.pyfai_install_status_label)
+        install_row = QtWidgets.QHBoxLayout()
+        pyfai_recheck_btn = QtWidgets.QPushButton("Recheck Installation")
+        pyfai_recheck_btn.clicked.connect(self._refresh_pyfai_install_status)
+        install_row.addWidget(pyfai_recheck_btn)
+        install_row.addStretch(1)
+        layout.addLayout(install_row)
+        layout.addSpacing(4)
+
+        # --- Input images ------------------------------------------------
+        input_header = QtWidgets.QLabel("Input Images")
+        input_header.setProperty("sectionHeader", True)
+        layout.addWidget(input_header)
+
+        input_top = QtWidgets.QHBoxLayout()
+        pyfai_browse_btn = QtWidgets.QPushButton("Browse Folder…")
+        pyfai_browse_btn.clicked.connect(self._browse_pyfai_input_folder)
+        input_top.addWidget(pyfai_browse_btn)
+        self.pyfai_input_folder_label = QtWidgets.QLabel("(no folder selected)")
+        self.pyfai_input_folder_label.setProperty("secondaryText", True)
+        self.pyfai_input_folder_label.setWordWrap(True)
+        input_top.addWidget(self.pyfai_input_folder_label, 1)
+        layout.addLayout(input_top)
+
+        self.pyfai_file_list = QtWidgets.QListWidget()
+        self.pyfai_file_list.setToolTip(
+            "Every *.cbf file found directly in the selected folder -- "
+            "check the ones to include in the average."
+        )
+        self.pyfai_file_list.itemChanged.connect(self._on_pyfai_selection_changed)
+        layout.addWidget(self.pyfai_file_list, 2)
+
+        select_row = QtWidgets.QHBoxLayout()
+        pyfai_select_all_btn = QtWidgets.QPushButton("Select All")
+        pyfai_select_all_btn.clicked.connect(lambda: self._pyfai_set_all_checked(True))
+        select_row.addWidget(pyfai_select_all_btn)
+        pyfai_select_none_btn = QtWidgets.QPushButton("Select None")
+        pyfai_select_none_btn.clicked.connect(lambda: self._pyfai_set_all_checked(False))
+        select_row.addWidget(pyfai_select_none_btn)
+        self.pyfai_selected_count_label = QtWidgets.QLabel("0 of 0 files selected")
+        self.pyfai_selected_count_label.setProperty("secondaryText", True)
+        select_row.addWidget(self.pyfai_selected_count_label)
+        select_row.addStretch(1)
+        layout.addLayout(select_row)
+        layout.addSpacing(4)
+
+        # --- Output --------------------------------------------------------
+        output_header = QtWidgets.QLabel("Output")
+        output_header.setProperty("sectionHeader", True)
+        layout.addWidget(output_header)
+
+        output_form = QtWidgets.QFormLayout()
+        output_form.setSpacing(6)
+
+        output_folder_row = QtWidgets.QHBoxLayout()
+        self.pyfai_output_folder_edit = QtWidgets.QLineEdit()
+        self.pyfai_output_folder_edit.setToolTip(
+            "Auto-derived from the input folder (id4b -> id4baux, "
+            "raw6M/... -> calibrations) when a folder is browsed -- "
+            "edit freely if the guess is wrong, or use Browse…."
+        )
+        output_folder_row.addWidget(self.pyfai_output_folder_edit, 1)
+        pyfai_browse_output_btn = QtWidgets.QPushButton("Browse…")
+        pyfai_browse_output_btn.clicked.connect(self._browse_pyfai_output_folder)
+        output_folder_row.addWidget(pyfai_browse_output_btn)
+        output_form.addRow("Output Folder:", output_folder_row)
+
+        self.pyfai_output_name_edit = QtWidgets.QLineEdit()
+        self.pyfai_output_name_edit.setPlaceholderText("e.g. CeO2_45keV_new.cbf")
+        self.pyfai_output_name_edit.setToolTip(
+            "Type the output file name yourself, e.g. CeO2_45keV_new.cbf."
+        )
+        output_form.addRow("Output File Name:", self.pyfai_output_name_edit)
+
+        self.pyfai_extra_args_edit = QtWidgets.QLineEdit()
+        self.pyfai_extra_args_edit.setPlaceholderText(
+            "optional, e.g. -m median --dark dark.cbf"
+        )
+        self.pyfai_extra_args_edit.setToolTip(
+            "Advanced: extra pyFAI-average command-line arguments, "
+            "appended verbatim. Leave blank to match the plain "
+            "\"pyFAI-average -o <output> <files...>\" form."
+        )
+        output_form.addRow("Extra arguments (advanced):", self.pyfai_extra_args_edit)
+
+        layout.addLayout(output_form)
+        layout.addSpacing(4)
+
+        run_row = QtWidgets.QHBoxLayout()
+        self.pyfai_run_btn = QtWidgets.QPushButton("Run pyFAI-average")
+        self.pyfai_run_btn.clicked.connect(self._run_pyfai_average)
+        run_row.addWidget(self.pyfai_run_btn)
+        run_row.addStretch(1)
+        layout.addLayout(run_row)
+
+        self.pyfai_status_label = QtWidgets.QLabel("")
+        self.pyfai_status_label.setWordWrap(True)
+        layout.addWidget(self.pyfai_status_label)
+
+        self.pyfai_log_text = QtWidgets.QTextEdit()
+        self.pyfai_log_text.setReadOnly(True)
+        self.pyfai_log_text.setPlaceholderText(
+            "The command that will be run, and its output, appear here."
+        )
+        self.pyfai_log_text.setMaximumHeight(160)
+        layout.addWidget(self.pyfai_log_text)
+
+        self._pyfai_thread = None  # keep a reference so it isn't GC'd mid-run
+        self._refresh_pyfai_install_status()
+
+        self.tabs.addTab(w, "pyFAI Average")
+
+    def _refresh_pyfai_install_status(self):
+        """Checks whether the `pyFAI-average` CLI (installed by the
+        `pyFAI` package) is available on PATH and updates the tab's
+        install-status panel -- never raises, so a broken/odd environment
+        just shows "not found" rather than crashing the tab."""
+        label = getattr(self, "pyfai_install_status_label", None)
+        if label is None:
+            return
+        try:
+            exe = shutil.which("pyFAI-average")
+        except Exception:
+            exe = None
+        if exe:
+            version_text = ""
+            try:
+                proc = subprocess.run(
+                    [exe, "--version"], capture_output=True, text=True, timeout=10,
+                )
+                version_text = (proc.stdout or proc.stderr or "").strip()
+            except Exception:
+                version_text = ""
+            label.setText(
+                f"pyFAI-average found: {exe}"
+                + (f" ({version_text})" if version_text else "")
+            )
+            label.setStyleSheet("color: #2e7d32;")
+        else:
+            label.setText(
+                "pyFAI-average was not found on PATH. Install the pyFAI "
+                "package first, e.g.:  pip install pyFAI   (or, on "
+                "managed/system Python installs:  "
+                "pip install pyFAI --break-system-packages). "
+                "This also needs to be installed on whichever machine "
+                "actually runs this GUI, not just here."
+            )
+            label.setStyleSheet("color: #cc3333;")
+
+    def _browse_pyfai_input_folder(self):
+        """Browse to the leaf folder actually containing the raw .cbf
+        frames (e.g. .../raw6M/CeO2_new/standard/300/CeO2_new_001) --
+        same QFileDialog.getExistingDirectory pattern Folder Timeline/
+        Live Image already use. Populates the checkable file list with
+        every *.cbf found directly in that folder (sorted), and
+        auto-derives (into an editable field) the matching
+        /nfs/chess/id4baux/.../calibrations output folder."""
+        start = self.current_browse_path if os.path.isdir(self.current_browse_path) else os.path.expanduser("~")
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Browse Folder (raw .cbf frames)", start
+        )
+        if not path:
+            return
+        try:
+            files = sorted(glob.glob(os.path.join(path, "*.cbf")))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Could not list {path!r}: {exc}")
+            return
+        self.pyfai_input_folder_label.setText(path)
+        self.pyfai_file_list.blockSignals(True)
+        self.pyfai_file_list.clear()
+        for f in files:
+            item = QtWidgets.QListWidgetItem(os.path.basename(f))
+            item.setData(QtCore.Qt.UserRole, f)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked)
+            self.pyfai_file_list.addItem(item)
+        self.pyfai_file_list.blockSignals(False)
+        self._update_pyfai_selected_count()
+        if not files:
+            self.pyfai_status_label.setText(f"No .cbf files found directly in {path}.")
+        else:
+            self.pyfai_status_label.setText("")
+        try:
+            derived = derive_pyfai_calibration_output_folder(path)
+        except Exception:
+            derived = ""
+        if derived:
+            self.pyfai_output_folder_edit.setText(derived)
+
+    def _pyfai_set_all_checked(self, checked: bool):
+        state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
+        self.pyfai_file_list.blockSignals(True)
+        for i in range(self.pyfai_file_list.count()):
+            self.pyfai_file_list.item(i).setCheckState(state)
+        self.pyfai_file_list.blockSignals(False)
+        self._update_pyfai_selected_count()
+
+    def _on_pyfai_selection_changed(self, _item):
+        self._update_pyfai_selected_count()
+
+    def _update_pyfai_selected_count(self):
+        total = self.pyfai_file_list.count()
+        checked = sum(
+            1 for i in range(total)
+            if self.pyfai_file_list.item(i).checkState() == QtCore.Qt.Checked
+        )
+        self.pyfai_selected_count_label.setText(f"{checked} of {total} files selected")
+
+    def _browse_pyfai_output_folder(self):
+        """Manual override for the Output Folder field -- the
+        auto-derivation in _browse_pyfai_input_folder() is only a
+        best-effort guess."""
+        start = self.pyfai_output_folder_edit.text() or self.current_browse_path
+        if not os.path.isdir(start):
+            start = os.path.dirname(start) or os.path.expanduser("~")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Browse Output Folder", start)
+        if path:
+            self.pyfai_output_folder_edit.setText(path)
+
+    def _run_pyfai_average(self):
+        """Validates everything up front (selected files, output folder,
+        output file name, and -- if present -- the extra-arguments text),
+        then launches PyFaiAverageThread in the background. Every failure
+        path here shows a clear QMessageBox/status message and returns
+        without starting anything -- never raises, per "make sure the
+        whole code should not break during averaging"."""
+        if self._pyfai_thread is not None and self._pyfai_thread.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, "pyFAI Average", "An averaging run is already in progress."
+            )
+            return
+
+        selected = [
+            self.pyfai_file_list.item(i).data(QtCore.Qt.UserRole)
+            for i in range(self.pyfai_file_list.count())
+            if self.pyfai_file_list.item(i).checkState() == QtCore.Qt.Checked
+        ]
+        if not selected:
+            QtWidgets.QMessageBox.warning(
+                self, "pyFAI Average",
+                "No input files are checked -- browse a folder and check "
+                "at least one .cbf frame first."
+            )
+            return
+
+        out_folder = self.pyfai_output_folder_edit.text().strip()
+        out_name = self.pyfai_output_name_edit.text().strip()
+        if not out_folder:
+            QtWidgets.QMessageBox.warning(
+                self, "pyFAI Average", "Please set an Output Folder."
+            )
+            return
+        if not out_name:
+            QtWidgets.QMessageBox.warning(
+                self, "pyFAI Average",
+                "Please type an Output File Name, e.g. CeO2_45keV_new.cbf."
+            )
+            return
+        out_path = os.path.join(out_folder, out_name)
+
+        extra_text = self.pyfai_extra_args_edit.text().strip()
+        extra_args: List[str] = []
+        if extra_text:
+            try:
+                extra_args = shlex.split(extra_text)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "pyFAI Average",
+                    f"Could not parse the extra arguments field: {exc}"
+                )
+                return
+
+        cmd_preview = " ".join(
+            shlex.quote(p) for p in (["pyFAI-average", "-o", out_path] + extra_args + selected)
+        )
+        self.pyfai_log_text.setPlainText(f"$ {cmd_preview}\n\nRunning...")
+        self.pyfai_status_label.setText(f"Averaging {len(selected)} file(s)...")
+        self.pyfai_status_label.setStyleSheet("")
+        self.pyfai_run_btn.setEnabled(False)
+
+        self._pyfai_thread = PyFaiAverageThread(selected, out_path, extra_args=extra_args)
+        self._pyfai_thread.finished_ok.connect(self._on_pyfai_finished_ok)
+        self._pyfai_thread.finished_error.connect(self._on_pyfai_finished_error)
+        self._pyfai_thread.start()
+
+    def _on_pyfai_finished_ok(self, output_path: str, log: str):
+        self.pyfai_run_btn.setEnabled(True)
+        self.pyfai_status_label.setText(f"Done -- wrote {output_path}")
+        self.pyfai_status_label.setStyleSheet("color: #2e7d32;")
+        existing = self.pyfai_log_text.toPlainText()
+        self.pyfai_log_text.setPlainText(
+            existing.split("\n\nRunning...")[0] + f"\n\n{log}" if log else existing
+        )
+        self.status_label.setText(f"pyFAI-average: wrote {output_path}")
+
+    def _on_pyfai_finished_error(self, message: str):
+        self.pyfai_run_btn.setEnabled(True)
+        self.pyfai_status_label.setText("Failed -- see details below.")
+        self.pyfai_status_label.setStyleSheet("color: #cc3333;")
+        existing = self.pyfai_log_text.toPlainText()
+        self.pyfai_log_text.setPlainText(
+            existing.split("\n\nRunning...")[0] + f"\n\n{message}"
+        )
+        QtWidgets.QMessageBox.critical(self, "pyFAI Average Failed", message)
+
     def _build_slack_alerts_tab(self):
         """Its own tab (moved out of Overall Summary per the user's
         request) for configuring and testing Slack Alerts -- posting a
@@ -3591,6 +4362,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             self.root_edit.setText(path)
             self._refresh_file_tree()
             self._auto_load_newest_in_browse_folder()
+            self._auto_load_timeline_for_root()
 
     def _on_root_edit_go(self):
         path = self.root_edit.text().strip()
@@ -3599,8 +4371,32 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             self.current_browse_path = path
             self._refresh_file_tree()
             self._auto_load_newest_in_browse_folder()
+            self._auto_load_timeline_for_root()
         else:
             QtWidgets.QMessageBox.warning(self, "Invalid Path", f"Not a valid directory:\n{path}")
+
+    def _auto_load_timeline_for_root(self):
+        """Per the user's explicit request, the Folder Timeline tab
+        should "automatically show the same Browse folder" as the rest
+        of the app, rather than needing its own separate manual "Browse
+        Folder…" click every time the Root folder changes. Called right
+        after the Root/Browse folder is (re)set (set_root_folder(),
+        _on_root_edit_go()) -- reuses the exact same loading logic as a
+        manual browse (_load_timeline_for_folder()), just silent on
+        failure (no popup dialog for a side-effect of changing the Root
+        folder that the user didn't directly ask for) and skipped
+        instead of erroring if that tab's widgets haven't been built yet
+        or self.root_path isn't a real directory. The "Browse Folder…"
+        button on the Folder Timeline tab itself (load_timeline()) still
+        works exactly as before, so a different folder can always be
+        picked for that tab specifically without affecting the Root
+        folder used elsewhere."""
+        if not hasattr(self, "timeline_table"):
+            return
+        root = getattr(self, "root_path", None)
+        if not root or not os.path.isdir(root):
+            return
+        self._load_timeline_for_folder(root, silent=True)
 
     def _auto_load_newest_in_browse_folder(self):
         """After the user points the file browser at a folder (Set Root
@@ -3736,42 +4532,78 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         folder at the folder of .cbf frames that goes with the SPEC file
         just loaded, so there's no need to Browse for it by hand -- the
         images always live alongside the SPEC file for a given experiment.
-        Pilatus frames are conventionally written into a "raw6M" subfolder
-        right next to the SPEC file (the QM2/ID4B layout), so that's tried
-        first; a few other common subfolder names already used elsewhere
-        in this dashboard's own scan-data-folder heuristics
-        (sc.find_scan_data / sc.spec_subfolders) are tried next, and the
-        SPEC file's own directory is the last-resort fallback so something
-        is always watched even if none of those exist. Runs on every file
-        load (not just the first), so switching to a different
-        experiment's SPEC file re-points the watch at that experiment's
-        own images instead of leaving it on the previous one. Also force-
-        enables "auto-search subfolders", since the actual scan currently
-        being written is nearly always one or more levels beneath
-        whichever of these folders is found (e.g. raw6M/<sample>/<scan>/).
-        A no-op if fabio isn't installed -- the Live Image tab has no
-        folder/recurse controls at all in that case (see its fabio-is-None
-        guard in _build_ui)."""
+
+        Per the user's explicit request, this now prefers the app's own
+        Root/Browse folder (self.root_path, set via "Browse Folder…"/
+        "Set Root Folder…" on the Home tab -- e.g.
+        /nfs/chess/id4b/2026-3/li-4964-a/) whenever that folder is a real
+        ancestor of the loaded SPEC file, rather than drilling straight
+        into a specific subfolder like raw6M underneath it. This still
+        finds the actual active frames: the recursive active-scan-dir
+        discovery forced on below (tab.recurse_cb / loader.configure
+        (recurse=True), which drives LiveImageLoader._locate_recursive()/
+        _live_find_active_scan_dir(), already used elsewhere in this
+        file) walks the *whole* tree under whatever folder is set here
+        to find whichever subfolder is actually being written to right
+        now -- so pointing this at the root folder instead of raw6M
+        still finds the live frames, it just no longer requires a
+        specific subfolder name to exist directly under the SPEC file's
+        own folder.
+
+        If the Root folder hasn't been set (still the default home
+        directory) or isn't actually an ancestor of this SPEC file (e.g.
+        the file was loaded by hand from somewhere unrelated to the
+        current Root), this falls back to the previous behavior: try a
+        few common subfolder names already used elsewhere in this
+        dashboard's own scan-data-folder heuristics (sc.find_scan_data /
+        sc.spec_subfolders) right next to the SPEC file, with the SPEC
+        file's own directory as the last resort -- so something sensible
+        is always watched either way, never the (potentially huge) home
+        directory itself.
+
+        Runs on every file load (not just the first), so switching to a
+        different experiment's SPEC file re-points the watch at that
+        experiment's own images instead of leaving it on the previous
+        one. A no-op if fabio isn't installed -- the Live Image tab has
+        no folder/recurse controls at all in that case (see its
+        fabio-is-None guard in _build_ui)."""
         tab = getattr(self, "live_image_tab", None)
         if tab is None or fabio is None or not hasattr(tab, "path_edit"):
             return
         spec_parent = os.path.dirname(os.path.abspath(spec_path))
-        candidate_names = ["raw6M", "tiffs", "rawpil", "data", "raw", "images"]
         folder = None
-        for name in candidate_names:
-            candidate = os.path.join(spec_parent, name)
-            if os.path.isdir(candidate):
-                folder = candidate
-                break
-        if folder is None:
-            folder = spec_parent
+        root = getattr(self, "root_path", None)
+        try:
+            is_ancestor = bool(root) and os.path.isdir(root) and (
+                os.path.commonpath([os.path.abspath(root), spec_parent])
+                == os.path.abspath(root)
+            )
+        except ValueError:
+            # os.path.commonpath raises ValueError for paths on different
+            # drives/mounts -- treat that as "not an ancestor" rather than
+            # letting it bubble up and abort the whole file load.
+            is_ancestor = False
+        if is_ancestor:
+            folder = root
+        else:
+            candidate_names = ["raw6M", "tiffs", "rawpil", "data", "raw", "images"]
+            for name in candidate_names:
+                candidate = os.path.join(spec_parent, name)
+                if os.path.isdir(candidate):
+                    folder = candidate
+                    break
+            if folder is None:
+                folder = spec_parent
         tab.path_edit.setText(folder)
         if not tab.recurse_cb.isChecked():
             tab.recurse_cb.setChecked(True)
         tab.loader.configure(recurse=True)  # belt-and-braces: force-applied
                                              # even if the checkbox above was
                                              # already checked (no toggled
-                                             # signal fires in that case)
+                                             # signal fires in that case) --
+                                             # essential now that folder can
+                                             # be a root-level BTR folder,
+                                             # not just a leaf raw6M folder
         tab.apply_folder()
 
     def _apply_loaded_data(self, df, columns, metadata, scan_info, label):
@@ -4096,7 +4928,111 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Home tab
     # ------------------------------------------------------------------
+    def _load_home_logo_pixmap(self, filename: str, max_height: int = 56):
+        """Look for `filename` inside HOME_LOGO_DIR (a logo/ folder next to
+        this script itself -- see that constant's own comment for why it's
+        resolved via __file__ rather than a hardcoded path) and return a
+        QPixmap scaled down to at most max_height tall, or None if the file
+        isn't there / fails to load as an image. Deliberately swallows
+        errors (missing file, unreadable, corrupt, whatever) rather than
+        raising -- the two logo files only exist on-site, not in the
+        sandbox this was developed in, so the Home tab footer needs to
+        degrade gracefully (just show whichever logo(s) ARE found, or none
+        at all) instead of breaking the whole tab over a missing image."""
+        try:
+            path = os.path.join(HOME_LOGO_DIR, filename)
+            if not os.path.isfile(path):
+                return None
+            pixmap = QtGui.QPixmap(path)
+            if pixmap.isNull():
+                return None
+            if pixmap.height() > max_height:
+                pixmap = pixmap.scaledToHeight(max_height, QtCore.Qt.SmoothTransformation)
+            return pixmap
+        except Exception:
+            return None
+
+    @staticmethod
+    def _apply_home_card_shadow(widget, blur=18, y_offset=3, alpha=90):
+        """Give a Home tab hero/feature-card widget a soft drop shadow, for
+        a bit more depth than a flat 1px border alone (the follow-up
+        "other ways to modernize" request). A fixed semi-transparent black
+        works fine under both the Dark and Light themes (it's a shadow,
+        not a themed color, so it doesn't need to be one of the
+        THEMES-driven module constants like the rest of this tab's
+        styling) -- QGraphicsDropShadowEffect instances aren't shared, so
+        each widget needs its own, hence this being a small helper called
+        once per card rather than one effect reused everywhere."""
+        effect = QtWidgets.QGraphicsDropShadowEffect(widget)
+        effect.setBlurRadius(blur)
+        effect.setOffset(0, y_offset)
+        effect.setColor(QtGui.QColor(0, 0, 0, alpha))
+        widget.setGraphicsEffect(effect)
+
+    def _on_home_feature_card_clicked(self, name: str):
+        """Click handler for a Home tab feature card -- makes the card act
+        as an actual navigation tile (the follow-up "other ways to
+        modernize" request: clickable cards) rather than being purely
+        descriptive. Every feature name in feature_items (see
+        _build_home_tab()) matches an actual tab's title exactly, EXCEPT
+        "Auto-detect New File" -- that one isn't its own tab, its checkbox
+        lives in the always-visible top toolbar above the tabs (see
+        _build_central()) -- so instead of switching tabs, this just gives
+        that checkbox keyboard focus and points the status bar at it."""
+        if name == "Auto-detect New File":
+            chk = getattr(self, "new_file_detect_chk", None)
+            if chk is not None:
+                chk.setFocus(QtCore.Qt.OtherFocusReason)
+            status_lbl = getattr(self, "status_label", None)
+            if status_lbl is not None:
+                status_lbl.setText(
+                    "Auto-detect new file is the checkbox in the top "
+                    "toolbar, next to Auto-Refresh (above the tabs) -- "
+                    "now focused."
+                )
+            return
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == name:
+                self.tabs.setCurrentIndex(i)
+                return
+
     def _build_home_tab(self):
+        """Home tab -- landing page shown first when the app opens. Given a
+        modern, card-based visual refresh per the user's explicit "make it
+        modern website" request (Home tab only -- confirmed via
+        AskUserQuestion that the rest of the app's look stays as-is): the
+        old plain-QLabel "name / description" grid and the single-line
+        keyboard-shortcuts sentence are now boxed cards / chips, reusing
+        the SAME cardStyle/sectionHeader/panelTitle QSS properties (see
+        _build_qss()) already used for the "readout card" look on the
+        Overall Summary and Temperature tabs, plus new homeHero/homeCard/
+        homeChip properties added alongside them for this tab specifically
+        -- so this stays visually consistent with the rest of the app
+        (and, importantly, still repaints correctly on a Dark/Light theme
+        switch, since it's real QSS rather than one-off hardcoded hex
+        colors) rather than looking like a bolted-on separate style.
+
+        Also updated per the user's explicit "update the new functionality
+        as well" follow-up: the feature list now covers Auto-detect New
+        File (previously missing entirely) and the Ion Chamber Flux
+        description now reflects its refresh-only Flux snapshot behavior
+        (see _snapshot_flux_from_energy()) instead of implying continuous
+        live updates.
+
+        Two logo images (chess_logo.png, chexs_logo.jpg) are shown at the
+        bottom via _load_home_logo_pixmap() / HOME_LOGO_DIR -- see those
+        for why they're resolved relative to this script's own directory
+        and why missing files are handled silently rather than as errors.
+
+        Follow-up "other ways to modernize" pass: the hero and each
+        feature card now get a soft drop shadow (_apply_home_card_shadow())
+        for depth instead of a flat border, homeHero/homeCard also got an
+        accent-colored stripe (top border on the hero, left border on
+        cards -- see _build_qss()), and the feature cards are now
+        clickable nav tiles that jump straight to that tab (see
+        _on_home_feature_card_clicked()), turning this from a purely
+        descriptive grid into something closer to a real dashboard home
+        page."""
         w = QtWidgets.QWidget()
         outer = QtWidgets.QVBoxLayout(w)
         outer.setContentsMargins(24, 24, 24, 24)
@@ -4109,11 +5045,22 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         content = QtWidgets.QWidget()
         scroll.setWidget(content)
         layout = QtWidgets.QVBoxLayout(content)
-        layout.setSpacing(14)
+        layout.setSpacing(16)
+
+        # ── Hero: title + subtitle + Get Started, boxed as a single card
+        # (homeHero) instead of sitting bare on the tab background -- this
+        # is the "modern landing page" touch the user asked for: a clear
+        # top banner block rather than a plain heading.
+        hero = QtWidgets.QFrame()
+        hero.setProperty("homeHero", True)
+        self._apply_home_card_shadow(hero, blur=24, y_offset=4, alpha=80)
+        hero_layout = QtWidgets.QVBoxLayout(hero)
+        hero_layout.setContentsMargins(20, 18, 20, 18)
+        hero_layout.setSpacing(10)
 
         title = QtWidgets.QLabel(HOME_PAGE_TITLE)
-        title.setStyleSheet("font-size: 22px; font-weight: bold;")
-        layout.addWidget(title)
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        hero_layout.addWidget(title)
 
         subtitle = QtWidgets.QLabel(
             "A native desktop viewer for SPEC scan files from the QM2 beamline "
@@ -4123,12 +5070,12 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         subtitle.setWordWrap(True)
         subtitle.setProperty("secondaryText", True)
         subtitle.setStyleSheet("font-size: 13px;")
-        layout.addWidget(subtitle)
+        hero_layout.addWidget(subtitle)
 
-        layout.addSpacing(6)
+        hero_layout.addSpacing(4)
         actions_label = QtWidgets.QLabel("Get started")
-        actions_label.setStyleSheet("font-size: 15px; font-weight: bold;")
-        layout.addWidget(actions_label)
+        actions_label.setProperty("panelTitle", True)
+        hero_layout.addWidget(actions_label)
 
         actions_row = QtWidgets.QHBoxLayout()
         btn_browse = QtWidgets.QPushButton("Browse Folder…")
@@ -4141,7 +5088,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         btn_sample.clicked.connect(self.load_sample_data)
         actions_row.addWidget(btn_sample)
         actions_row.addStretch(1)
-        layout.addLayout(actions_row)
+        hero_layout.addLayout(actions_row)
 
         self.home_status_label = QtWidgets.QLabel(
             "No file loaded yet — use the buttons above, or double-click a "
@@ -4150,20 +5097,24 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         self.home_status_label.setWordWrap(True)
         self.home_status_label.setProperty("secondaryText", True)
         self.home_status_label.setStyleSheet("font-style: italic;")
-        layout.addWidget(self.home_status_label)
+        hero_layout.addWidget(self.home_status_label)
 
-        layout.addSpacing(10)
+        layout.addWidget(hero)
+
+        # ── Feature grid, now as a 2-column grid of boxed cards (homeCard)
+        # instead of a plain "bullet name / wrapped description" list --
+        # each card gets its own border and a subtle accent-colored border
+        # on hover, matching the "readout card" look used elsewhere in the
+        # app. Kept as (name, description) pairs so the content itself is
+        # still easy to scan/edit as plain text.
         features_label = QtWidgets.QLabel("What you can do here")
-        features_label.setStyleSheet("font-size: 15px; font-weight: bold;")
+        features_label.setProperty("sectionHeader", True)
         layout.addWidget(features_label)
 
-        features_grid = QtWidgets.QGridLayout()
-        features_grid.setHorizontalSpacing(20)
-        features_grid.setVerticalSpacing(8)
         feature_items = [
-            ("Overall Summary", "At-a-glance Beam Condition (CESR/IC1 (Ion Chamber 1)/IC2 (Ion Chamber 2)/Diode) and Temperature Information (Stage 1 (A)/Sample Temp/Stage 2 (C)/Flow Rate) readouts, refreshed live, with a dark-red No Beam banner when CESR reads near zero — plus a mini plot that always follows the latest scan."),
+            ("Overall Summary", "At-a-glance Beam Condition (CESR/IC1 (Ion Chamber 1)/IC2 (Ion Chamber 2)/Diode/Energy) and Temperature Information (Stage 1 (A)/Sample Temp/Stage 2 (C)/Flow Rate) readouts, refreshed live, with a dark-red No Beam banner when CESR reads near zero — plus a mini plot that always follows the latest scan."),
             ("Temperature", "A full-size, freely zoomable version of the Temperature Vs Time plot (Stage 1 (A) red / Sample Temp green / Stage 2 (C) blue), with a live-value legend and a grid on/off checkbox — for a closer look than the small strip on Overall Summary."),
-            ("Ion Chamber Flux", "Calculator for X-ray flux from ion chamber counts (ported from the CHESS Ion Chamber Flux Calculator) — pick IC1/IC2/Custom, gas, and absorption mechanism; Energy and Counts can follow the same live readings shown on Overall Summary (Energy from the Beam Condition row, Counts from IC1/IC2), or be typed in by hand."),
+            ("Ion Chamber Flux", "Calculator for X-ray flux from ion chamber counts (ported from the CHESS Ion Chamber Flux Calculator) — pick IC1/IC2/Custom, gas, and absorption mechanism. With \"Follow live values\" checked, Energy and Counts are filled in as a one-time snapshot each time you click \"Refresh Energy\" on Overall Summary — not continuously updated — or you can type either value in by hand at any time."),
             ("SPEC Plot", "Pick X/Y columns, overlay multiple scans, switch line/scatter/line+scatter/bar, normalize, or use log scale. Sensible defaults are picked automatically when you load a file. Optionally overlay a Gaussian or Lorentzian peak fit (via SciPy), a scan from a separately-loaded reference file, or — during Auto-Refresh — the previous plot as a ghost overlay for quick before/after comparison. Save or copy the chart itself as a PNG image."),
             ("Live Image (Pilatus)", "Watch a folder of .cbf detector frames and see the newest one update in real time, with colormap choices and an optional ROI monitor."),
             ("Folder Timeline", "Every scan across every SPEC file in a folder, sorted chronologically, with a data-folder lookup and a downloadable PDF experiment summary."),
@@ -4171,28 +5122,96 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             ("Motor Positions", "Per-scan motor positions read from the SPEC header."),
             ("Export", "Export all data, just the plotted data, or a chosen set of scans/columns to CSV."),
             ("Slack Alerts", "Configure a Slack Bot Token and channel, then get a Slack message automatically whenever beam is lost or restored — including the live CESR mA reading and the current status text from new-status.chess.cornell.edu/ID4B when it can be fetched. Runs continuously in the background regardless of which tab is open."),
+            ("Auto-detect New File", "Watch the loaded file's folder for a SPEC file with a newer modification time and switch to it automatically — no manual Browse/Load needed. Different from Auto-Refresh, which only re-polls the SAME file for newly-appended scans; this notices when SPEC starts writing an entirely different file (e.g. a new day's or sample's) and switches over. Checks every 5 seconds."),
         ]
+        features_grid = QtWidgets.QGridLayout()
+        features_grid.setHorizontalSpacing(14)
+        features_grid.setVerticalSpacing(14)
+        cols = 2
         for i, (name, desc) in enumerate(feature_items):
-            name_lbl = QtWidgets.QLabel(f"● {name}")
-            name_lbl.setStyleSheet("font-weight: bold;")
+            card = QtWidgets.QFrame()
+            card.setProperty("homeCard", True)
+            self._apply_home_card_shadow(card)
+            # Clickable nav tile (follow-up "other ways to modernize"
+            # request): PyQt5's QFrame has no built-in clicked signal, so
+            # this overrides mousePressEvent directly on the instance --
+            # the standard lightweight way to make a plain QFrame
+            # click-sensitive without writing a whole QFrame subclass just
+            # for this one tab. See _on_home_feature_card_clicked() for
+            # what a click actually does (switch to that tab, or for
+            # "Auto-detect New File" -- not its own tab -- focus its
+            # toolbar checkbox instead).
+            card.setCursor(QtCore.Qt.PointingHandCursor)
+            if name == "Auto-detect New File":
+                card.setToolTip("Click to jump to the Auto-detect new file checkbox in the top toolbar.")
+            else:
+                card.setToolTip(f"Click to open the {name} tab.")
+            card.mousePressEvent = (
+                lambda event, feature_name=name: self._on_home_feature_card_clicked(feature_name)
+            )
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 10, 14, 10)
+            card_layout.setSpacing(4)
+            name_lbl = QtWidgets.QLabel(name)
+            name_lbl.setProperty("panelTitle", True)
             desc_lbl = QtWidgets.QLabel(desc)
             desc_lbl.setWordWrap(True)
             desc_lbl.setProperty("secondaryText", True)
-            features_grid.addWidget(name_lbl, i, 0, QtCore.Qt.AlignTop)
-            features_grid.addWidget(desc_lbl, i, 1)
-        features_grid.setColumnStretch(1, 1)
+            desc_lbl.setStyleSheet("font-size: 12px;")
+            card_layout.addWidget(name_lbl)
+            card_layout.addWidget(desc_lbl)
+            features_grid.addWidget(card, i // cols, i % cols)
+        for c in range(cols):
+            features_grid.setColumnStretch(c, 1)
         layout.addLayout(features_grid)
 
-        layout.addSpacing(10)
-        shortcuts_label = QtWidgets.QLabel(
-            "Keyboard shortcuts:   Ctrl+O — set root / browse    •    "
-            "Ctrl+P — jump to SPEC Plot    •    Ctrl+T — jump to Scan Info    •    "
-            "Ctrl+E — jump to Export"
-        )
-        shortcuts_label.setWordWrap(True)
-        shortcuts_label.setProperty("secondaryText", True)
-        shortcuts_label.setStyleSheet("font-size: 12px;")
+        # ── Keyboard shortcuts, now as small pill-shaped "chips" (homeChip)
+        # in a row instead of one long sentence — easier to scan at a
+        # glance, same modern-card visual language as the feature grid
+        # above. The shortcuts themselves are unchanged (still exactly the
+        # 4 QShortcut/QAction bindings defined in _build_menu_bar()).
+        shortcuts_label = QtWidgets.QLabel("Keyboard shortcuts")
+        shortcuts_label.setProperty("sectionHeader", True)
         layout.addWidget(shortcuts_label)
+
+        shortcuts_row = QtWidgets.QHBoxLayout()
+        shortcuts_row.setSpacing(8)
+        for chip_text in (
+            "Ctrl+O — set root / browse",
+            "Ctrl+P — jump to SPEC Plot",
+            "Ctrl+T — jump to Scan Info",
+            "Ctrl+E — jump to Export",
+        ):
+            chip = QtWidgets.QLabel(chip_text)
+            chip.setProperty("homeChip", True)
+            shortcuts_row.addWidget(chip)
+        shortcuts_row.addStretch(1)
+        layout.addLayout(shortcuts_row)
+
+        # ── Footer: CHESS logo(s), centered, at the very bottom of the
+        # Home tab. See _load_home_logo_pixmap()/HOME_LOGO_DIR for where
+        # these are looked up from (a logo/ folder next to this script,
+        # on-site) and why a missing file is handled silently. If NEITHER
+        # logo is found (e.g. running in a sandbox/dev checkout without
+        # the logo/ folder at all), the footer row is simply omitted
+        # rather than showing an empty gap.
+        footer_row = QtWidgets.QHBoxLayout()
+        footer_row.addStretch(1)
+        any_logo = False
+        for logo_filename in ("chess_logo.png", "chexs_logo.jpg"):
+            pixmap = self._load_home_logo_pixmap(logo_filename)
+            if pixmap is None:
+                continue
+            logo_lbl = QtWidgets.QLabel()
+            logo_lbl.setPixmap(pixmap)
+            logo_lbl.setToolTip(logo_filename)
+            footer_row.addWidget(logo_lbl)
+            footer_row.addSpacing(28)
+            any_logo = True
+        footer_row.addStretch(1)
+        if any_logo:
+            layout.addSpacing(8)
+            layout.addLayout(footer_row)
 
         layout.addStretch(1)
         self.tabs.addTab(w, "Home")
@@ -5311,8 +6330,12 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             status_lbl = getattr(self, "status_label", None)
             if status_lbl is not None:
                 status_lbl.setText(msg)
-            lbl = getattr(self, "beam_signal_labels", {}).get("energy")
-            if lbl is not None:
+            # self.beam_signal_labels["energy"] is a list of QLabels (the
+            # Summary tab's card, plus the Pilatus-tab mirror's card if
+            # built) -- set the tooltip on every one, not just a single
+            # label, so the failure reason shows up wherever Energy is
+            # displayed.
+            for lbl in getattr(self, "beam_signal_labels", {}).get("energy") or []:
                 lbl.setToolTip(msg)
             # Deliberately NOT touching Flux/self._live_flux_snapshot here:
             # a failed refresh leaves the last good Flux snapshot on
@@ -5512,39 +6535,51 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
                 "source": "network",
                 "column": "ID4B_MON_KEV (EPICS)",
             }
-        for canonical, lbl in getattr(self, "beam_signal_labels", {}).items():
+        # self.beam_signal_labels is {canonical: [QLabel, ...]}, not a
+        # single QLabel per channel -- the Beam Condition row is now
+        # mirrored onto the Live Image (Pilatus) tab as well as the
+        # Summary tab (per the user's explicit request), so each
+        # canonical channel can have more than one on-screen label to
+        # keep in sync; the inner loop below just pushes the exact same
+        # text/tooltip out to every label currently registered for that
+        # channel, however many there are (1 if a tab isn't mirrored,
+        # 2 with the Pilatus-tab mirror added).
+        for canonical, lbls in getattr(self, "beam_signal_labels", {}).items():
             info = values.get(canonical) or {}
             value = info.get("value")
             source = info.get("source")
             column = info.get("column")
             if value is None:
-                lbl.setText("—")
-                lbl.setToolTip("No live value (no matching SPEC column" +
-                                (", network fetch off)" if not use_network
-                                 else " and network fetch found nothing)"))
+                text = "—"
+                tooltip = ("No live value (no matching SPEC column" +
+                           (", network fetch off)" if not use_network
+                            else " and network fetch found nothing)"))
             else:
-                lbl.setText(f"{value:,.2f}")
+                text = f"{value:,.2f}"
                 # Names the exact SPEC column (or PV) the number came from,
                 # so a wrong-looking value can be diagnosed at a glance --
                 # e.g. it matched some other, differently-numbered column
                 # by mistake -- instead of just being trusted blindly.
                 if source == "spec":
-                    lbl.setToolTip(f"Source: loaded SPEC file, column \"{column}\"")
+                    tooltip = f"Source: loaded SPEC file, column \"{column}\""
                 elif canonical == "energy":
                     # Energy's live value always comes from the
                     # EnergyEpicsFetchThread cache (self._live_energy_value),
                     # never from chess_signals' own HTTP path -- see this
                     # method's docstring and _refresh_energy_now().
-                    lbl.setToolTip(
+                    tooltip = (
                         "Source: live EPICS Channel Access, PV ID4B_MON_KEV "
                         "-- click \"Refresh Energy\" for an updated reading."
                     )
                 else:
-                    # CESR/IC1/IC2/Diode: HTTP only
+                    # CESR/IC1/IC2/Diode/Mostab: HTTP only
                     # (signals.chess.cornell.edu) -- see chess_signals.py's
                     # module docstring for why EPICS was fully backed out
                     # of this path.
-                    lbl.setToolTip(f"Source: live network (signals.chess.cornell.edu), PV {column}")
+                    tooltip = f"Source: live network (signals.chess.cornell.edu), PV {column}"
+            for lbl in lbls:
+                lbl.setText(text)
+                lbl.setToolTip(tooltip)
 
         cesr_value = (values.get("cesr") or {}).get("value")
         no_beam = csig.is_no_beam(cesr_value, self._last_no_beam_state)
@@ -5914,10 +6949,31 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Browse Folder", self.current_browse_path)
         if not path:
             return
+        self._load_timeline_for_folder(path, silent=False)
+
+    def _load_timeline_for_folder(self, path: str, silent: bool):
+        """Actual Folder-Timeline-loading logic for a given folder,
+        factored out of load_timeline() so the exact same loading can
+        also run automatically whenever the app's Root/Browse folder
+        changes (see _auto_load_timeline_for_root()), without duplicating
+        this code or losing the manual "Browse Folder…" button's own
+        behavior (which still calls load_timeline() above, unchanged).
+
+        silent=True (the automatic-on-Root-change path) swallows/reports
+        errors via the status bar only, rather than popping up a
+        QMessageBox.critical the user didn't directly ask for -- e.g. if
+        the Root folder has no SPEC files at all, that's not something
+        worth interrupting the user over. silent=False (the manual
+        "Browse Folder…" path) keeps the original behavior of showing
+        the error dialog, since there the user explicitly asked to load
+        that exact folder and deserves to know if it failed."""
         try:
             rows = sc.folder_timeline(path)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Error", str(exc))
+            if silent:
+                self.status_label.setText(f"Folder Timeline: could not scan {path} ({exc})")
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", str(exc))
             return
         self._timeline_rows = rows
         self._timeline_folder_path = path
@@ -6170,38 +7226,122 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
     def _render_summary_pdf(self, path, tmp_dir, folder, by_file, sample_files,
                              calib_files, subfolder_map, ordered_files,
                              overall_start, overall_end, duration_str, total_scans):
+        BRAND_RED = rl_colors.HexColor("#8B0000")  # dark red, matches the
+        # branded title/section-heading color requested for this PDF.
         styles = getSampleStyleSheet()
-        title_style = styles["Title"]
-        heading_style = styles["Heading2"]
+        title_style = styles["Title"].clone("BrandTitle")
+        title_style.textColor = BRAND_RED
+        heading_style = styles["Heading2"].clone("BrandHeading")
+        heading_style.textColor = BRAND_RED
         body_style = styles["BodyText"]
         small_style = styles["BodyText"].clone("Small")
         small_style.fontSize = 8
         small_style.leading = 10
+        # Cell styles for the two Tables below -- every cell value is
+        # wrapped in a Paragraph using one of these, rather than passed as
+        # a bare string. reportlab's Table does NOT word-wrap plain
+        # strings: a value wider than its column just overflows/overlaps
+        # neighboring cells instead of wrapping and growing the row's
+        # height, which is exactly what produced numbers/text sitting
+        # outside the table/overlapping each other. Paragraph flowables
+        # wrap properly and expand their row automatically.
+        stat_cell_style = styles["BodyText"].clone("StatCell")
+        stat_cell_style.fontSize = 9
+        stat_cell_style.leading = 11
+        stat_label_style = stat_cell_style.clone("StatLabel")
+        stat_label_style.fontName = "Helvetica-Bold"
+        detail_cell_style = styles["BodyText"].clone("DetailCell")
+        detail_cell_style.fontSize = 7.5
+        detail_cell_style.leading = 9
+        detail_header_style = detail_cell_style.clone("DetailHeader")
+        detail_header_style.fontName = "Helvetica-Bold"
+
+        def _cell(text, style=None):
+            """Wrap a table cell's text in a Paragraph (see note above);
+            empty values stay as "" so a spanned/blank cell doesn't grow
+            a stray empty line."""
+            text = "" if text in (None, "") else str(text)
+            if not text:
+                return ""
+            return Paragraph(text, style or detail_cell_style)
 
         story = []
         folder_name = os.path.basename(os.path.normpath(folder)) if folder else "Experiment"
-        story.append(Paragraph(f"Experiment Summary — {folder_name}", title_style))
-        story.append(Spacer(1, 4))
-        story.append(Paragraph(f"Folder: {folder or 'N/A'}", body_style))
+        story.append(Paragraph(f"CHESS QM2 Experiment Summary — {folder_name}", title_style))
+        story.append(Spacer(1, 6))
+        story.append(HRFlowable(width="100%", thickness=1.2, color=BRAND_RED, spaceAfter=10))
+
+        # ── Data locations (raw / processed / calibration) ──────────────
+        # Processed-data and calibration-data folders are best-effort
+        # derived from the raw folder via the id4b -> id4baux convention
+        # (see _derive_processed_and_calib_folders()); if the raw folder
+        # doesn't follow that convention, those two rows are simply
+        # omitted rather than showing a guessed path as fact.
+        processed_folder, calib_folder = _derive_processed_and_calib_folders(folder)
+        loc_rows = [
+            [_cell("Raw data stored at:", stat_label_style), _cell(folder or "N/A", stat_cell_style)],
+        ]
+        if processed_folder:
+            loc_rows.append([_cell("Processed data stored at:", stat_label_style),
+                              _cell(processed_folder, stat_cell_style)])
+        if calib_folder:
+            loc_rows.append([_cell("Calibration data at:", stat_label_style),
+                              _cell(calib_folder, stat_cell_style)])
+        loc_table = Table(loc_rows, colWidths=[140, 400])
+        loc_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(loc_table)
         story.append(Spacer(1, 12))
+
+        # ── Narrative intro paragraph ────────────────────────────────────
+        # A short plain-language summary up front, ahead of the stat
+        # cards/tables/charts below, mentioning the facility, the
+        # experiment's start/end dates, and how many samples it covered
+        # (alignment scans and the CeO2 calibration standard are not
+        # samples, so they're left out of that count here specifically --
+        # see _counts_toward_summary_sample()).
+        intro_samples = [sf for sf in (sample_files + calib_files) if _counts_toward_summary_sample(sf)]
+        intro_sentences = [
+            "This summary was generated at the CHESS Quantum Materials Beamline (QM2, ID4B)."
+        ]
+        if overall_start and overall_end:
+            span = f"The experiment ran from {overall_start['timestamp']} to {overall_end['timestamp']}"
+            span += f", spanning {duration_str}" if duration_str else ""
+            intro_sentences.append(span + ".")
+        elif overall_start:
+            intro_sentences.append(f"The experiment began on {overall_start['timestamp']}.")
+        n_samples = len(intro_samples)
+        sample_word = "sample" if n_samples == 1 else "samples"
+        intro_sentences.append(
+            f"It covered {n_samples} {sample_word} (alignment scans and the CeO2 "
+            f"calibration standard excluded) across {total_scans} scan"
+            f"{'s' if total_scans != 1 else ''}."
+        )
+        story.append(Paragraph(" ".join(intro_sentences), body_style))
+        story.append(Spacer(1, 14))
 
         # ── Stat overview (mirrors the on-screen stat cards) ────────────
         calib_note = ", ".join(calib_files) if calib_files else "none"
         stat_rows = [
-            ["Samples", str(len(sample_files)), f"Calibration files excluded: {calib_note}"],
-            ["Total Scans", str(total_scans), f"Across {len(sample_files) + len(calib_files)} SPEC files"],
-            ["Experiment Start", overall_start["timestamp"] if overall_start else "N/A",
-             f"{overall_start['spec_file']} scan {overall_start['scan_number']}" if overall_start else ""],
-            ["Experiment End", overall_end["timestamp"] if overall_end else "N/A",
-             f"Duration: {duration_str}" if duration_str else ""],
+            [_cell("Samples", stat_label_style), _cell(len(sample_files), stat_cell_style),
+             _cell(f"Calibration files excluded: {calib_note}", stat_cell_style)],
+            [_cell("Total Scans", stat_label_style), _cell(total_scans, stat_cell_style),
+             _cell(f"Across {len(sample_files) + len(calib_files)} SPEC files", stat_cell_style)],
+            [_cell("Experiment Start", stat_label_style),
+             _cell(overall_start["timestamp"] if overall_start else "N/A", stat_cell_style),
+             _cell(f"{overall_start['spec_file']} scan {overall_start['scan_number']}" if overall_start else "", stat_cell_style)],
+            [_cell("Experiment End", stat_label_style),
+             _cell(overall_end["timestamp"] if overall_end else "N/A", stat_cell_style),
+             _cell(f"Duration: {duration_str}" if duration_str else "", stat_cell_style)],
         ]
         stat_table = Table(stat_rows, colWidths=[110, 150, 220])
         stat_table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
             ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#cccccc")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("BACKGROUND", (0, 0), (0, -1), rl_colors.HexColor("#f0f0f0")),
+            ("BACKGROUND", (0, 0), (0, -1), rl_colors.HexColor("#fbeaea")),
         ]))
         story.append(stat_table)
         story.append(Spacer(1, 16))
@@ -6210,7 +7350,7 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
         story.append(Paragraph("Per-File Detail", heading_style))
         story.append(Spacer(1, 6))
         headers = ["SPEC File", "Scans", "Temperatures", "Scan Types", "Sub-sample", "Sub Scans", "Sub Temps"]
-        detail_rows = [headers]
+        detail_rows = [[_cell(h, detail_header_style) for h in headers]]
         for sf in ordered_files:
             f = by_file.get(sf, {})
             is_calib = _is_calibration(sf)
@@ -6224,62 +7364,122 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
                 for i, sub in enumerate(subs):
                     sub_temps = ", ".join(f"{t} K" for t in sub.get("temperatures", [])) or "—"
                     detail_rows.append([
-                        label if i == 0 else "", f.get("scans", 0) if i == 0 else "",
-                        temps if i == 0 else "", cmd_top if i == 0 else "",
-                        sub.get("name", ""), str(sub.get("scan_count", "") or "—"), sub_temps,
+                        _cell(label if i == 0 else ""), _cell(f.get("scans", 0) if i == 0 else ""),
+                        _cell(temps if i == 0 else ""), _cell(cmd_top if i == 0 else ""),
+                        _cell(sub.get("name", "")), _cell(str(sub.get("scan_count", "") or "—")), _cell(sub_temps),
                     ])
             else:
-                detail_rows.append([label, f.get("scans", 0), temps, cmd_top, "—", "—", "—"])
+                detail_rows.append([_cell(label), _cell(f.get("scans", 0)), _cell(temps), _cell(cmd_top),
+                                     _cell("—"), _cell("—"), _cell("—")])
         detail_table = Table(
             detail_rows, repeatRows=1,
             colWidths=[95, 40, 75, 90, 70, 55, 65],
         )
         detail_table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
             ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#cccccc")),
-            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#e5e5e5")),
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#fbeaea")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f7f7f7")]),
         ]))
         story.append(detail_table)
         story.append(Spacer(1, 16))
 
-        # ── Charts, exported at high resolution from the live pyqtgraph
-        # panels so they match what's shown on screen. ────────────────────
+        # ── Charts: built fresh here (rather than reusing the live
+        # on-screen panels in self._timeline_summary_panels) so the PDF
+        # always gets light-themed, white-background charts regardless of
+        # which app theme (dark by default) is currently active -- exporting
+        # the live panels directly would bake in a dark background and, in
+        # dark theme, low-contrast colors on a white page. These throwaway
+        # panels are never added to any visible layout and are discarded
+        # right after export; the "light" palette is only active on the
+        # module's color globals for the duration of this block. ──────────
         story.append(Paragraph("Charts", heading_style))
         story.append(Spacer(1, 6))
-        panels = self._timeline_summary_panels or {}
         chart_specs = [
             ("bar", "Scans per SPEC File"),
             ("temp", "Temperature Coverage"),
             ("gantt", "Experiment Timeline (per SPEC File)"),
         ]
-        for key, caption in chart_specs:
-            panel = panels.get(key)
-            if panel is None:
-                continue
-            img_path = os.path.join(tmp_dir, f"{key}.png")
-            try:
-                exporter = pg.exporters.ImageExporter(panel.plot_widget.plotItem)
-                exporter.parameters()["width"] = 1400
-                exporter.export(img_path)
-            except Exception:
-                continue
-            if not os.path.exists(img_path):
-                continue
-            with PILImage.open(img_path) as im:
-                src_w, src_h = im.size
-            max_w = 6.4 * inch
-            display_w = max_w
-            display_h = display_w * (src_h / src_w) if src_w else 3 * inch
-            max_h = 4.2 * inch
-            if display_h > max_h:
-                display_h = max_h
-                display_w = display_h * (src_w / src_h) if src_h else max_w
-            story.append(Paragraph(caption, small_style))
-            story.append(RLImage(img_path, width=display_w, height=display_h))
-            story.append(Spacer(1, 10))
+        prev_theme = self.current_theme
+        switched_theme = prev_theme != "light"
+        if switched_theme:
+            _apply_theme_globals("light")
+            pg.setConfigOptions(antialias=True, background=BG_PANEL, foreground=TEXT_PRIMARY,
+                                 imageAxisOrder="row-major")
+        try:
+            export_panels = {
+                "bar": self._build_summary_bar_chart(by_file, sample_files, calib_files, subfolder_map),
+                "temp": self._build_summary_temp_chart(by_file, sample_files, calib_files, subfolder_map),
+                "gantt": self._build_summary_gantt_chart(by_file, sample_files, calib_files),
+            }
+            for key, caption in chart_specs:
+                panel = export_panels.get(key)
+                if panel is None:
+                    continue
+                img_path = os.path.join(tmp_dir, f"{key}.png")
+                try:
+                    # These throwaway panels are never added to a layout or
+                    # shown, so without this they still have whatever tiny
+                    # default size a freshly-constructed QWidget gets -- too
+                    # small for pyqtgraph's GraphicsLayout to allocate a row
+                    # for the title, which then silently collapses to zero
+                    # height and renders as missing. Force a real size and
+                    # let Qt process the resulting layout/resize events
+                    # synchronously before exporting.
+                    panel.resize(1200, 800)
+                    panel.plot_widget.resize(1200, 800)
+                    app = QtWidgets.QApplication.instance()
+                    if app is not None:
+                        app.processEvents()
+                    exporter = pg.exporters.ImageExporter(panel.plot_widget.plotItem)
+                    exporter.parameters()["width"] = 1400
+                    exporter.export(img_path)
+                except Exception:
+                    continue
+                finally:
+                    panel.setParent(None)
+                    panel.deleteLater()
+                if not os.path.exists(img_path):
+                    continue
+                with PILImage.open(img_path) as im:
+                    src_w, src_h = im.size
+                max_w = 6.4 * inch
+                display_w = max_w
+                display_h = display_w * (src_h / src_w) if src_w else 3 * inch
+                max_h = 4.2 * inch
+                if display_h > max_h:
+                    display_h = max_h
+                    display_w = display_h * (src_w / src_h) if src_h else max_w
+                story.append(Paragraph(caption, small_style))
+                story.append(RLImage(img_path, width=display_w, height=display_h))
+                story.append(Spacer(1, 10))
+        finally:
+            if switched_theme:
+                _apply_theme_globals(prev_theme)
+                pg.setConfigOptions(antialias=True, background=BG_PANEL, foreground=TEXT_PRIMARY,
+                                     imageAxisOrder="row-major")
+
+        # ── CHESS logo footer ────────────────────────────────────────────────
+        # Only on-site checkouts ship a logo/ folder (see HOME_LOGO_DIR /
+        # _find_summary_pdf_logo_paths()), so this entire block is a no-op --
+        # not a broken image -- on a dev machine or sandbox without it.
+        logo_paths = _find_summary_pdf_logo_paths()
+        if logo_paths:
+            story.append(Spacer(1, 14))
+            story.append(HRFlowable(width="100%", thickness=0.75, color=rl_colors.HexColor("#cccccc")))
+            story.append(Spacer(1, 8))
+            for logo_path in logo_paths:
+                try:
+                    with PILImage.open(logo_path) as im:
+                        src_w, src_h = im.size
+                    disp_h = 0.5 * inch
+                    disp_w = disp_h * (src_w / src_h) if src_h else disp_h
+                    logo_img = RLImage(logo_path, width=disp_w, height=disp_h)
+                    logo_img.hAlign = "CENTER"
+                    story.append(logo_img)
+                    story.append(Spacer(1, 4))
+                except Exception:
+                    continue
 
         doc = SimpleDocTemplate(
             path, pagesize=letter,
@@ -6398,7 +7598,8 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             return panel
 
         axis = panel.plot_widget.getAxis("bottom")
-        axis.setTicks([[(i, _short_label(sf)) for i, sf in enumerate(all_files)]])
+        label_len = _label_max_len_for_count(len(all_files))
+        axis.setTicks([[(i, _short_label(sf, label_len)) for i, sf in enumerate(all_files)]])
         x = np.arange(len(all_files), dtype=float)
 
         all_sub_names: List[str] = []
@@ -6443,7 +7644,8 @@ class SpecDashboardApp(QtWidgets.QMainWindow):
             return panel
 
         axis = panel.plot_widget.getAxis("bottom")
-        axis.setTicks([[(i, _short_label(sf)) for i, sf in enumerate(all_files)]])
+        label_len = _label_max_len_for_count(len(all_files))
+        axis.setTicks([[(i, _short_label(sf, label_len)) for i, sf in enumerate(all_files)]])
 
         spots = []
         for i, sf in enumerate(all_files):
